@@ -31,9 +31,9 @@ def get_post_service(db: Database = Depends(get_db)) -> PostService:
 )
 @limiter.limit("50/hour")
 async def create_post(
-    req: Request,
+    request: Request,
     community_id: UUID,
-    request: PostCreateRequest,
+    body: PostCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: PostService = Depends(get_post_service)
 ):
@@ -41,7 +41,7 @@ async def create_post(
     return await service.create_post(
         community_id=community_id,
         author_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E9: PATCH /api/v1/communities/{community_id}/posts/{post_id}
@@ -51,10 +51,10 @@ async def create_post(
 )
 @limiter.limit("30/hour")
 async def update_post(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
-    request: PostUpdateRequest,
+    body: PostUpdateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: PostService = Depends(get_post_service)
 ):
@@ -62,7 +62,7 @@ async def update_post(
     return await service.update_post(
         post_id=post_id,
         updating_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E10: DELETE /api/v1/communities/{community_id}/posts/{post_id}
@@ -72,7 +72,7 @@ async def update_post(
 )
 @limiter.limit("30/hour")
 async def delete_post(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),

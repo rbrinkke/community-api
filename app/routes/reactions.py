@@ -26,10 +26,10 @@ def get_reaction_service(db: Database = Depends(get_db)) -> ReactionService:
 )
 @limiter.limit("200/hour")
 async def create_post_reaction(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
-    request: ReactionCreateRequest,
+    body: ReactionCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: ReactionService = Depends(get_reaction_service)
 ):
@@ -38,7 +38,7 @@ async def create_post_reaction(
         user_id=UUID(current_user.user_id),
         target_type='post',
         target_id=post_id,
-        request=request
+        request=body
     )
 
 # E17: DELETE /api/v1/communities/{community_id}/posts/{post_id}/reactions
@@ -48,7 +48,7 @@ async def create_post_reaction(
 )
 @limiter.limit("200/hour")
 async def delete_post_reaction(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -69,11 +69,11 @@ async def delete_post_reaction(
 )
 @limiter.limit("200/hour")
 async def create_comment_reaction(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
-    request: ReactionCreateRequest,
+    body: ReactionCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: ReactionService = Depends(get_reaction_service)
 ):
@@ -82,7 +82,7 @@ async def create_comment_reaction(
         user_id=UUID(current_user.user_id),
         target_type='comment',
         target_id=comment_id,
-        request=request
+        request=body
     )
 
 # E19: DELETE /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}/reactions
@@ -92,7 +92,7 @@ async def create_comment_reaction(
 )
 @limiter.limit("200/hour")
 async def delete_comment_reaction(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,

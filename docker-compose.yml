@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  community-api:
+    build: .
+    ports:
+      - "8003:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres_secure_password_change_in_prod@activity-postgres-db:5432/activitydb
+      - REDIS_URL=redis://auth-redis:6379/0
+      - JWT_SECRET_KEY=dev-secret-key-change-in-production
+      - JWT_ALGORITHM=HS256
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=15
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - API_V1_PREFIX=/api/v1
+      - PROJECT_NAME=Community API
+      - DB_POOL_MIN_SIZE=10
+      - DB_POOL_MAX_SIZE=20
+      - LOG_LEVEL=INFO
+      - RATE_LIMIT_ENABLED=true
+    networks:
+      - activity-network
+    container_name: community-api
+
+networks:
+  activity-network:
+    external: true

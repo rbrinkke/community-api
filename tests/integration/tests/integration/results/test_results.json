@@ -1,0 +1,17 @@
+{
+  "test_suite": "Community API Integration Tests",
+  "start_time": "2025-11-13T14:36:47+01:00",
+  "configuration": {
+    "api_base_url": "http://localhost:8003",
+    "database": "localhost:5441/activitydb",
+    "test_prefix": "test_api_"
+  },
+  "tests": [],
+  "summary": {
+    "total": 0,
+    "passed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 0
+  }
+}

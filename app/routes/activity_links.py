@@ -25,9 +25,9 @@ def get_reaction_service(db: Database = Depends(get_db)) -> ReactionService:
 )
 @limiter.limit("20/hour")
 async def link_activity_to_community(
-    req: Request,
+    request: Request,
     community_id: UUID,
-    request: CommunityActivityLinkRequest,
+    body: CommunityActivityLinkRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: ReactionService = Depends(get_reaction_service)
 ):
@@ -35,5 +35,5 @@ async def link_activity_to_community(
     return await service.link_activity_to_community(
         community_id=community_id,
         linking_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )

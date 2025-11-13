@@ -54,10 +54,10 @@ BEGIN
     -- 3. Validate slug uniqueness
     IF EXISTS (
         SELECT 1 FROM activity.communities
-        WHERE slug = p_slug
+        WHERE communities.slug = p_slug
         AND (
-            (organization_id = p_organization_id) OR
-            (organization_id IS NULL AND p_organization_id IS NULL)
+            (communities.organization_id = p_organization_id) OR
+            (communities.organization_id IS NULL AND p_organization_id IS NULL)
         )
     ) THEN
         RAISE EXCEPTION 'SLUG_EXISTS';

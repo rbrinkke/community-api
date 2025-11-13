@@ -34,15 +34,15 @@ def get_community_service(db: Database = Depends(get_db)) -> CommunityService:
 )
 @limiter.limit("10/hour")
 async def create_community(
-    req: Request,
-    request: CommunityCreateRequest,
+    request: Request,
+    body: CommunityCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)
 ):
     """Create a new community"""
     return await service.create_community(
         creator_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E2: GET /api/v1/communities/{community_id}
@@ -75,9 +75,9 @@ async def get_community(
 )
 @limiter.limit("20/hour")
 async def update_community(
-    req: Request,
+    request: Request,
     community_id: UUID,
-    request: CommunityUpdateRequest,
+    body: CommunityUpdateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)
 ):
@@ -85,7 +85,7 @@ async def update_community(
     return await service.update_community(
         community_id=community_id,
         updating_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E4: POST /api/v1/communities/{community_id}/join
@@ -96,7 +96,7 @@ async def update_community(
 )
 @limiter.limit("30/hour")
 async def join_community(
-    req: Request,
+    request: Request,
     community_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)
@@ -114,7 +114,7 @@ async def join_community(
 )
 @limiter.limit("20/hour")
 async def leave_community(
-    req: Request,
+    request: Request,
     community_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)

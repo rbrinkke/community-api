@@ -31,10 +31,10 @@ def get_comment_service(db: Database = Depends(get_db)) -> CommentService:
 )
 @limiter.limit("100/hour")
 async def create_comment(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
-    request: CommentCreateRequest,
+    body: CommentCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommentService = Depends(get_comment_service)
 ):
@@ -42,7 +42,7 @@ async def create_comment(
     return await service.create_comment(
         post_id=post_id,
         author_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E13: PATCH /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}
@@ -52,11 +52,11 @@ async def create_comment(
 )
 @limiter.limit("50/hour")
 async def update_comment(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
-    request: CommentUpdateRequest,
+    body: CommentUpdateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommentService = Depends(get_comment_service)
 ):
@@ -64,7 +64,7 @@ async def update_comment(
     return await service.update_comment(
         comment_id=comment_id,
         updating_user_id=UUID(current_user.user_id),
-        request=request
+        request=body
     )
 
 # E14: DELETE /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}
@@ -74,7 +74,7 @@ async def update_comment(
 )
 @limiter.limit("50/hour")
 async def delete_comment(
-    req: Request,
+    request: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
