@@ -1,0 +1,1448 @@
+ # COMMUNITY API - BUILD INSTRUCTIONS FOR CLAUDE CODE
+## AI Agent Implementation Guide
+
+**Target Agent**: Claude Code (Agentic AI Developer)  
+**Task**: Build complete Community API microservice  
+**Reference Documents**: 
+- COMMUNITY_API_SPECIFICATIONS.md (primary spec)
+- auth-api-specifications (authentication reference)
+- fastapi-requirements (architecture blueprint)
+- sqlschema.sql (database schema)
+
+---
+
+## CRITICAL CONTEXT FOR AI AGENT
+
+### What You Are Building
+A FastAPI microservice for community management with:
+- 18 stored procedures (database layer)
+- 20 REST API endpoints (HTTP layer)
+- Full CRUD for communities, posts, comments, reactions
+- PostgreSQL + Redis stack
+- JWT authentication (shared from auth-api)
+
+### What You Are NOT Building
+- ❌ Direct SQL queries (only stored procedures)
+- ❌ Authentication logic (reuse from auth-api)
+- ❌ Frontend code
+- ❌ Database schema (already exists)
+
+### Success Criteria
+1. All 18 stored procedures created and tested
+2. All 20 endpoints functional with correct error handling
+3. 100% stored procedure usage (zero raw SQL in API code)
+4. Rate limiting functional on mutation endpoints
+5. All Pydantic schemas validate correctly
+6. Health check passes with database connectivity
+
+---
+
+## BUILD ORDER (FOLLOW EXACTLY)
+
+### PHASE 1: Project Foundation (30 minutes)
+Build the skeleton following fastapi-requirements blueprint.
+
+#### Step 1.1: Create Directory Structure
+```bash
+mkdir -p community-api/{app/{core,models,routes,services,utils,middleware},tests}
+cd community-api
+```
+
+Create these exact files (empty initially):
+```
+community-api/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── database.py
+│   │   ├── auth.py
+│   │   ├── errors.py
+│   │   └── logging_config.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── community.py
+│   │   ├── post.py
+│   │   ├── comment.py
+│   │   ├── reaction.py
+│   │   └── common.py
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   ├── health.py
+│   │   ├── communities.py
+│   │   ├── posts.py
+│   │   ├── comments.py
+│   │   ├── reactions.py
+│   │   └── activity_links.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── community_service.py
+│   │   ├── post_service.py
+│   │   ├── comment_service.py
+│   │   └── reaction_service.py
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   ├── stored_procedures.py
+│   │   └── pagination.py
+│   └── middleware/
+│       ├── __init__.py
+│       └── correlation.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_communities.py
+│   ├── test_posts.py
+│   └── conftest.py
+├── requirements.txt
+├── .env.example
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
+```
+
+#### Step 1.2: Create requirements.txt
+```txt
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+asyncpg==0.29.0
+redis==5.0.1
+python-jose[cryptography]==3.3.0
+slowapi==0.1.9
+structlog==24.1.0
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.26.0
+```
+
+#### Step 1.3: Create .env.example
+```bash
+# API Configuration
+ENVIRONMENT=development
+DEBUG=true
+API_V1_PREFIX=/api/v1
+PROJECT_NAME=Community API
+
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/activity_db
+DB_POOL_MIN_SIZE=10
+DB_POOL_MAX_SIZE=20
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# JWT (shared with auth-api)
+JWT_SECRET_KEY=your-secret-key-here
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=15
+
+# Logging
+LOG_LEVEL=INFO
+
+# Rate Limiting
+RATE_LIMIT_ENABLED=true
+```
+
+#### Step 1.4: Implement app/config.py
+```python
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    # Environment
+    ENVIRONMENT: str = "development"
+    DEBUG: bool = False
+    
+    # API
+    API_V1_PREFIX: str = "/api/v1"
+    PROJECT_NAME: str = "Community API"
+    
+    # Database
+    DATABASE_URL: str
+    DB_POOL_MIN_SIZE: int = 10
+    DB_POOL_MAX_SIZE: int = 20
+    
+    # Redis
+    REDIS_URL: str
+    
+    # JWT (shared with auth-api)
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    
+    # Rate Limiting
+    RATE_LIMIT_ENABLED: bool = True
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
+```
+
+**Validation Checkpoint**: Run `python -c "from app.config import settings; print(settings.PROJECT_NAME)"` - should print "Community API"
+
+---
+
+### PHASE 2: Core Infrastructure (45 minutes)
+
+#### Step 2.1: Implement app/core/logging_config.py
+Copy exact implementation from fastapi-requirements document:
+- Use structlog
+- JSON output in production, console in development
+- Include correlation_id in all logs
+- Add timestamp, log level, logger name
+
+**Validation**: Import and call `setup_logging("development")` - should not error
+
+#### Step 2.2: Implement app/core/database.py
+```python
+import asyncpg
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+import structlog
+from app.config import settings
+
+logger = structlog.get_logger()
+
+class Database:
+    def __init__(self):
+        self.pool: Optional[asyncpg.Pool] = None
+    
+    async def connect(self):
+        """Create connection pool"""
+        logger.info("connecting_to_database", url=settings.DATABASE_URL.split('@')[1])
+        self.pool = await asyncpg.create_pool(
+            settings.DATABASE_URL,
+            min_size=settings.DB_POOL_MIN_SIZE,
+            max_size=settings.DB_POOL_MAX_SIZE,
+            command_timeout=60
+        )
+        logger.info("database_connected")
+    
+    async def disconnect(self):
+        """Close connection pool"""
+        if self.pool:
+            await self.pool.close()
+            logger.info("database_disconnected")
+    
+    @asynccontextmanager
+    async def get_connection(self) -> AsyncGenerator[asyncpg.Connection, None]:
+        """Get connection from pool"""
+        if not self.pool:
+            raise RuntimeError("Database pool not initialized")
+        
+        async with self.pool.acquire() as connection:
+            yield connection
+
+db = Database()
+
+async def get_db() -> Database:
+    """Dependency for getting database instance"""
+    return db
+```
+
+**Validation**: Should compile without errors
+
+#### Step 2.3: Implement app/core/auth.py
+```python
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
+from typing import Optional, Dict
+import structlog
+from app.config import settings
+
+logger = structlog.get_logger()
+security = HTTPBearer()
+
+class CurrentUser:
+    """Container for current user from JWT token"""
+    def __init__(
+        self,
+        user_id: str,
+        email: str,
+        subscription_level: str = "free",
+        ghost_mode: bool = False,
+        org_id: Optional[str] = None
+    ):
+        self.user_id = user_id
+        self.email = email
+        self.subscription_level = subscription_level
+        self.ghost_mode = ghost_mode
+        self.org_id = org_id
+
+def decode_token(token: str) -> Dict:
+    """Decode and validate JWT token"""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        return payload
+    except JWTError as e:
+        logger.error("jwt_decode_error", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> CurrentUser:
+    """Extract current user from JWT token (required)"""
+    payload = decode_token(credentials.credentials)
+    
+    return CurrentUser(
+        user_id=payload.get("sub"),
+        email=payload.get("email"),
+        subscription_level=payload.get("subscription_level", "free"),
+        ghost_mode=payload.get("ghost_mode", False),
+        org_id=payload.get("org_id")
+    )
+
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        HTTPBearer(auto_error=False)
+    )
+) -> Optional[CurrentUser]:
+    """Extract current user from JWT token (optional)"""
+    if not credentials:
+        return None
+    
+    try:
+        payload = decode_token(credentials.credentials)
+        return CurrentUser(
+            user_id=payload.get("sub"),
+            email=payload.get("email"),
+            subscription_level=payload.get("subscription_level", "free"),
+            ghost_mode=payload.get("ghost_mode", False),
+            org_id=payload.get("org_id")
+        )
+    except HTTPException:
+        return None
+```
+
+**Validation**: Should compile without errors
+
+#### Step 2.4: Implement app/core/errors.py
+```python
+from fastapi import HTTPException
+from typing import Dict
+from datetime import datetime
+
+# Error code to HTTP status mapping
+ERROR_STATUS_MAP: Dict[str, int] = {
+    'USER_NOT_FOUND': 404,
+    'COMMUNITY_NOT_FOUND': 404,
+    'POST_NOT_FOUND': 404,
+    'COMMENT_NOT_FOUND': 404,
+    'ACTIVITY_NOT_FOUND': 404,
+    'ORGANIZATION_NOT_FOUND': 404,
+    'INSUFFICIENT_PERMISSIONS': 403,
+    'NOT_MEMBER': 403,
+    'NOT_COMMUNITY_ORGANIZER': 403,
+    'NOT_ACTIVITY_ORGANIZER': 403,
+    'ORGANIZER_CANNOT_LEAVE': 403,
+    'COMMUNITY_NOT_OPEN': 403,
+    'SLUG_EXISTS': 409,
+    'ALREADY_MEMBER': 400,
+    'COMMUNITY_FULL': 409,
+    'LINK_ALREADY_EXISTS': 409,
+    'COMMUNITY_NOT_ACTIVE': 400,
+    'POST_NOT_PUBLISHED': 400,
+    'COMMENT_DELETED': 400,
+    'PARENT_COMMENT_NOT_FOUND': 400,
+    'INVALID_COMMUNITY_TYPE': 400,
+    'INVALID_TARGET_TYPE': 400,
+    'TARGET_NOT_FOUND': 404,
+    'NOT_ORGANIZATION_MEMBER': 403,
+}
+
+# Error code to human-readable message mapping
+ERROR_MESSAGES: Dict[str, str] = {
+    'USER_NOT_FOUND': 'User not found',
+    'COMMUNITY_NOT_FOUND': 'Community not found',
+    'POST_NOT_FOUND': 'Post not found',
+    'COMMENT_NOT_FOUND': 'Comment not found',
+    'ACTIVITY_NOT_FOUND': 'Activity not found',
+    'ORGANIZATION_NOT_FOUND': 'Organization not found',
+    'INSUFFICIENT_PERMISSIONS': 'Insufficient permissions',
+    'NOT_MEMBER': 'Not a community member',
+    'NOT_COMMUNITY_ORGANIZER': 'Not a community organizer',
+    'NOT_ACTIVITY_ORGANIZER': 'Not an activity organizer',
+    'ORGANIZER_CANNOT_LEAVE': 'Organizer cannot leave community',
+    'COMMUNITY_NOT_OPEN': 'Community is not open',
+    'SLUG_EXISTS': 'Community slug already exists',
+    'ALREADY_MEMBER': 'Already a member',
+    'COMMUNITY_FULL': 'Community is full',
+    'LINK_ALREADY_EXISTS': 'Activity already linked to community',
+    'COMMUNITY_NOT_ACTIVE': 'Community is not active',
+    'POST_NOT_PUBLISHED': 'Post is not published',
+    'COMMENT_DELETED': 'Comment has been deleted',
+    'PARENT_COMMENT_NOT_FOUND': 'Parent comment not found',
+    'INVALID_COMMUNITY_TYPE': 'Invalid community type',
+    'INVALID_TARGET_TYPE': 'Invalid target type',
+    'TARGET_NOT_FOUND': 'Target not found',
+    'NOT_ORGANIZATION_MEMBER': 'Not an organization member',
+}
+
+def parse_db_error(error_message: str) -> str:
+    """Extract error code from database exception message"""
+    # PostgreSQL RAISE EXCEPTION format: "ERROR_CODE"
+    if isinstance(error_message, str):
+        for error_code in ERROR_STATUS_MAP.keys():
+            if error_code in error_message:
+                return error_code
+    return "UNKNOWN_ERROR"
+
+def raise_http_exception(error_code: str):
+    """Raise HTTPException with proper status code and message"""
+    status_code = ERROR_STATUS_MAP.get(error_code, 500)
+    message = ERROR_MESSAGES.get(error_code, "An unexpected error occurred")
+    
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "detail": message,
+            "error_code": error_code,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+```
+
+**Validation**: Should compile without errors
+
+#### Step 2.5: Implement app/middleware/correlation.py
+Copy exact implementation from fastapi-requirements document:
+- Generate or extract X-Trace-ID
+- Bind to structlog context
+- Add to response headers
+
+**Validation**: Should compile without errors
+
+#### Step 2.6: Implement app/routes/health.py
+```python
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+import structlog
+from app.core.database import Database, get_db
+
+logger = structlog.get_logger()
+router = APIRouter()
+
+@router.get("/health")
+async def health_check(db: Database = Depends(get_db)):
+    """Health check endpoint"""
+    checks = {"api": "ok"}
+    
+    # Check database
+    try:
+        async with db.get_connection() as conn:
+            await conn.fetchval("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        logger.error("health_check_database_failed", error=str(e))
+        checks["database"] = "error"
+    
+    all_ok = all(v == "ok" for v in checks.values())
+    status_code = 200 if all_ok else 503
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ok" if all_ok else "degraded",
+            "checks": checks
+        }
+    )
+```
+
+**Validation**: Should compile without errors
+
+#### Step 2.7: Implement app/main.py
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import structlog
+
+from app.config import settings
+from app.core.logging_config import setup_logging
+from app.core.database import db
+from app.middleware.correlation import CorrelationMiddleware
+from app.routes import health, communities, posts, comments, reactions, activity_links
+
+# Setup logging
+setup_logging(settings.ENVIRONMENT)
+logger = structlog.get_logger()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup
+    logger.info("starting_application", environment=settings.ENVIRONMENT)
+    await db.connect()
+    yield
+    # Shutdown
+    logger.info("shutting_down_application")
+    await db.disconnect()
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Middleware
+app.add_middleware(CorrelationMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.DEBUG else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routes
+app.include_router(health.router, tags=["health"])
+app.include_router(
+    communities.router,
+    prefix=f"{settings.API_V1_PREFIX}/communities",
+    tags=["communities"]
+)
+app.include_router(
+    posts.router,
+    prefix=f"{settings.API_V1_PREFIX}/communities",
+    tags=["posts"]
+)
+app.include_router(
+    comments.router,
+    prefix=f"{settings.API_V1_PREFIX}/communities",
+    tags=["comments"]
+)
+app.include_router(
+    reactions.router,
+    prefix=f"{settings.API_V1_PREFIX}/communities",
+    tags=["reactions"]
+)
+app.include_router(
+    activity_links.router,
+    prefix=f"{settings.API_V1_PREFIX}/communities",
+    tags=["activity-links"]
+)
+
+@app.get("/")
+async def root():
+    return {
+        "service": settings.PROJECT_NAME,
+        "version": "1.0.0",
+        "environment": settings.ENVIRONMENT
+    }
+```
+
+**Validation Checkpoint**: Run `python -m app.main` - should start without errors (will fail database connection, that's OK)
+
+---
+
+### PHASE 3: Database Layer - Stored Procedures (2 hours)
+
+**CRITICAL**: Create ALL stored procedures in PostgreSQL before building API code.
+
+#### Step 3.1: Create stored_procedures.sql file
+Create a single SQL file with all 18 stored procedures from COMMUNITY_API_SPECIFICATIONS.md.
+
+File: `database/stored_procedures.sql`
+
+For each stored procedure (SP1-SP18):
+1. Copy the exact signature from specifications
+2. Implement the logic as specified
+3. Add error handling with RAISE EXCEPTION
+4. Test each procedure individually
+
+**Implementation Order**:
+```sql
+-- SP1: sp_community_create
+-- SP2: sp_community_get_by_id
+-- SP3: sp_community_update
+-- SP4: sp_community_join
+-- SP5: sp_community_leave
+-- SP6: sp_community_get_members
+-- SP7: sp_community_search
+-- SP8: sp_community_post_create
+-- SP9: sp_community_post_update
+-- SP10: sp_community_post_delete
+-- SP11: sp_community_post_get_feed
+-- SP12: sp_community_comment_create
+-- SP13: sp_community_comment_update
+-- SP14: sp_community_comment_delete
+-- SP15: sp_community_post_get_comments
+-- SP16: sp_community_reaction_create
+-- SP17: sp_community_reaction_delete
+-- SP18: sp_community_link_activity
+```
+
+**Example Implementation Pattern** (SP1):
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_create(
+    p_creator_user_id UUID,
+    p_organization_id UUID,
+    p_name VARCHAR(255),
+    p_slug VARCHAR(100),
+    p_description TEXT,
+    p_community_type activity.community_type,
+    p_cover_image_url VARCHAR(500),
+    p_icon_url VARCHAR(500),
+    p_max_members INT,
+    p_tags TEXT[]
+) RETURNS TABLE(
+    community_id UUID,
+    slug VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE,
+    member_count INT
+) AS $$
+DECLARE
+    v_community_id UUID;
+    v_created_at TIMESTAMP WITH TIME ZONE;
+BEGIN
+    -- 1. Validate user exists
+    IF NOT EXISTS (SELECT 1 FROM activity.users WHERE user_id = p_creator_user_id) THEN
+        RAISE EXCEPTION 'USER_NOT_FOUND';
+    END IF;
+    
+    -- 2. If org provided, validate membership
+    IF p_organization_id IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM activity.organizations WHERE organization_id = p_organization_id) THEN
+            RAISE EXCEPTION 'ORGANIZATION_NOT_FOUND';
+        END IF;
+        
+        IF NOT EXISTS (
+            SELECT 1 FROM activity.organization_members 
+            WHERE organization_id = p_organization_id 
+            AND user_id = p_creator_user_id
+        ) THEN
+            RAISE EXCEPTION 'NOT_ORGANIZATION_MEMBER';
+        END IF;
+    END IF;
+    
+    -- 3. Validate slug uniqueness
+    IF EXISTS (
+        SELECT 1 FROM activity.communities 
+        WHERE slug = p_slug 
+        AND (
+            (organization_id = p_organization_id) OR 
+            (organization_id IS NULL AND p_organization_id IS NULL)
+        )
+    ) THEN
+        RAISE EXCEPTION 'SLUG_EXISTS';
+    END IF;
+    
+    -- 4. Validate community type (Phase 1: only 'open')
+    IF p_community_type != 'open' THEN
+        RAISE EXCEPTION 'INVALID_COMMUNITY_TYPE';
+    END IF;
+    
+    -- 5. Insert community
+    INSERT INTO activity.communities (
+        organization_id,
+        creator_user_id,
+        name,
+        slug,
+        description,
+        community_type,
+        status,
+        member_count,
+        max_members,
+        cover_image_url,
+        icon_url
+    ) VALUES (
+        p_organization_id,
+        p_creator_user_id,
+        p_name,
+        p_slug,
+        p_description,
+        p_community_type,
+        'active',
+        1,
+        p_max_members,
+        p_cover_image_url,
+        p_icon_url
+    ) RETURNING communities.community_id, communities.created_at
+    INTO v_community_id, v_created_at;
+    
+    -- 6. Insert creator as organizer
+    INSERT INTO activity.community_members (
+        community_id,
+        user_id,
+        role,
+        status
+    ) VALUES (
+        v_community_id,
+        p_creator_user_id,
+        'organizer',
+        'active'
+    );
+    
+    -- 7. Insert tags if provided
+    IF p_tags IS NOT NULL AND array_length(p_tags, 1) > 0 THEN
+        INSERT INTO activity.community_tags (community_id, tag)
+        SELECT v_community_id, unnest(p_tags);
+    END IF;
+    
+    -- 8. Return community details
+    RETURN QUERY
+    SELECT v_community_id, p_slug, v_created_at, 1;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**Validation for Each SP**:
+```sql
+-- Test SP1
+SELECT * FROM activity.sp_community_create(
+    '550e8400-e29b-41d4-a716-446655440000'::UUID,
+    NULL,
+    'Test Community',
+    'test-community',
+    'Test Description',
+    'open'::activity.community_type,
+    NULL,
+    NULL,
+    100,
+    ARRAY['tag1', 'tag2']
+);
+
+-- Expected: Returns community_id, slug, created_at, 1
+-- Expected Error: If user doesn't exist, raises 'USER_NOT_FOUND'
+```
+
+**Critical**: Test EVERY stored procedure with:
+1. ✅ Success case
+2. ❌ Each error case (validate error messages)
+
+---
+
+### PHASE 4: Utility Layer (30 minutes)
+
+#### Step 4.1: Implement app/utils/stored_procedures.py
+```python
+import asyncpg
+from typing import List, Dict, Any, Optional
+import structlog
+from app.core.database import Database
+from app.core.errors import parse_db_error, raise_http_exception
+
+logger = structlog.get_logger()
+
+async def execute_stored_procedure(
+    db: Database,
+    procedure_name: str,
+    **kwargs
+) -> List[Dict[str, Any]]:
+    """
+    Execute a stored procedure and return results
+    
+    Args:
+        db: Database instance
+        procedure_name: Full procedure name (e.g., 'activity.sp_community_create')
+        **kwargs: Procedure parameters
+    
+    Returns:
+        List of result rows as dictionaries
+    
+    Raises:
+        HTTPException: With appropriate status code and error details
+    """
+    # Build parameter list
+    params = []
+    param_placeholders = []
+    for i, (key, value) in enumerate(kwargs.items(), start=1):
+        params.append(value)
+        param_placeholders.append(f'${i}')
+    
+    # Build query
+    query = f"SELECT * FROM {procedure_name}({', '.join(param_placeholders)})"
+    
+    logger.debug(
+        "executing_stored_procedure",
+        procedure=procedure_name,
+        params={k: str(v)[:50] for k, v in kwargs.items()}
+    )
+    
+    try:
+        async with db.get_connection() as conn:
+            rows = await conn.fetch(query, *params)
+            
+            # Convert to list of dicts
+            results = [dict(row) for row in rows]
+            
+            logger.debug(
+                "stored_procedure_success",
+                procedure=procedure_name,
+                row_count=len(results)
+            )
+            
+            return results
+            
+    except asyncpg.exceptions.RaiseError as e:
+        # Database raised custom error
+        error_code = parse_db_error(str(e))
+        logger.warning(
+            "stored_procedure_error",
+            procedure=procedure_name,
+            error_code=error_code,
+            error_message=str(e)
+        )
+        raise_http_exception(error_code)
+        
+    except asyncpg.exceptions.PostgresError as e:
+        # Other database error
+        logger.error(
+            "database_error",
+            procedure=procedure_name,
+            error=str(e),
+            code=e.sqlstate
+        )
+        raise_http_exception("DATABASE_ERROR")
+        
+    except Exception as e:
+        # Unexpected error
+        logger.error(
+            "unexpected_error",
+            procedure=procedure_name,
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise_http_exception("INTERNAL_ERROR")
+```
+
+**Validation**: Should compile without errors
+
+#### Step 4.2: Implement app/utils/pagination.py
+```python
+from typing import List, TypeVar, Generic
+from pydantic import BaseModel
+
+T = TypeVar('T')
+
+class PaginationMeta(BaseModel):
+    limit: int
+    offset: int
+    total_count: int
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: List[T]
+    pagination: PaginationMeta
+
+def build_pagination_response(
+    items: List[T],
+    total_count: int,
+    limit: int,
+    offset: int
+) -> PaginatedResponse[T]:
+    """Build paginated response"""
+    return PaginatedResponse(
+        items=items,
+        pagination=PaginationMeta(
+            limit=limit,
+            offset=offset,
+            total_count=total_count
+        )
+    )
+```
+
+**Validation**: Should compile without errors
+
+---
+
+### PHASE 5: Pydantic Models (45 minutes)
+
+Implement ALL Pydantic models from COMMUNITY_API_SPECIFICATIONS.md section "REQUEST/RESPONSE SCHEMAS".
+
+#### Step 5.1: app/models/common.py
+```python
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+class PaginationMeta(BaseModel):
+    limit: int
+    offset: int
+    total_count: int
+
+class ErrorResponse(BaseModel):
+    detail: str
+    error_code: Optional[str] = None
+    timestamp: datetime
+```
+
+#### Step 5.2: app/models/community.py
+Copy ALL community schemas from specifications:
+- CommunityCreateRequest
+- CommunityCreateResponse
+- CommunityUpdateRequest
+- CommunityUpdateResponse
+- CommunityDetailResponse
+- CommunityListItem
+- CommunitySearchResponse
+
+**Example**:
+```python
+from pydantic import BaseModel, Field, field_validator, HttpUrl
+from typing import Optional, List, Literal
+from uuid import UUID
+from datetime import datetime
+
+class CommunityCreateRequest(BaseModel):
+    organization_id: Optional[UUID] = None
+    name: str = Field(..., min_length=1, max_length=255)
+    slug: str = Field(..., min_length=1, max_length=100, pattern=r'^[a-z0-9-]+$')
+    description: Optional[str] = Field(None, max_length=5000)
+    community_type: Literal['open'] = 'open'
+    cover_image_url: Optional[HttpUrl] = None
+    icon_url: Optional[HttpUrl] = None
+    max_members: Optional[int] = Field(None, gt=0)
+    tags: Optional[List[str]] = Field(None, max_length=20)
+    
+    @field_validator('tags')
+    def validate_tags(cls, v):
+        if v:
+            for tag in v:
+                if len(tag) > 100:
+                    raise ValueError('Each tag must be max 100 characters')
+        return v
+
+# ... implement all other schemas
+```
+
+#### Step 5.3: app/models/post.py
+Copy ALL post schemas from specifications
+
+#### Step 5.4: app/models/comment.py
+Copy ALL comment schemas from specifications
+
+#### Step 5.5: app/models/reaction.py
+Copy ALL reaction schemas from specifications
+
+**Validation Checkpoint**: Run `python -c "from app.models import community, post, comment, reaction; print('OK')"` - should print OK
+
+---
+
+### PHASE 6: Service Layer (2 hours)
+
+Implement business logic services that call stored procedures.
+
+#### Step 6.1: app/services/community_service.py
+
+```python
+from typing import List, Optional
+from uuid import UUID
+import structlog
+
+from app.core.database import Database
+from app.utils.stored_procedures import execute_stored_procedure
+from app.models.community import (
+    CommunityCreateRequest,
+    CommunityCreateResponse,
+    CommunityUpdateRequest,
+    CommunityUpdateResponse,
+    CommunityDetailResponse,
+    CommunityListItem,
+)
+
+logger = structlog.get_logger()
+
+class CommunityService:
+    def __init__(self, db: Database):
+        self.db = db
+    
+    async def create_community(
+        self,
+        creator_user_id: UUID,
+        request: CommunityCreateRequest
+    ) -> CommunityCreateResponse:
+        """Create a new community"""
+        logger.info("creating_community", slug=request.slug)
+        
+        results = await execute_stored_procedure(
+            self.db,
+            "activity.sp_community_create",
+            p_creator_user_id=creator_user_id,
+            p_organization_id=request.organization_id,
+            p_name=request.name,
+            p_slug=request.slug,
+            p_description=request.description,
+            p_community_type=request.community_type,
+            p_cover_image_url=str(request.cover_image_url) if request.cover_image_url else None,
+            p_icon_url=str(request.icon_url) if request.icon_url else None,
+            p_max_members=request.max_members,
+            p_tags=request.tags
+        )
+        
+        return CommunityCreateResponse(**results[0])
+    
+    async def get_community(
+        self,
+        community_id: UUID,
+        requesting_user_id: Optional[UUID]
+    ) -> Optional[CommunityDetailResponse]:
+        """Get community by ID"""
+        logger.info("getting_community", community_id=str(community_id))
+        
+        results = await execute_stored_procedure(
+            self.db,
+            "activity.sp_community_get_by_id",
+            p_community_id=community_id,
+            p_requesting_user_id=requesting_user_id
+        )
+        
+        if not results:
+            return None
+        
+        return CommunityDetailResponse(**results[0])
+    
+    async def update_community(
+        self,
+        community_id: UUID,
+        updating_user_id: UUID,
+        request: CommunityUpdateRequest
+    ) -> CommunityUpdateResponse:
+        """Update community"""
+        logger.info("updating_community", community_id=str(community_id))
+        
+        results = await execute_stored_procedure(
+            self.db,
+            "activity.sp_community_update",
+            p_community_id=community_id,
+            p_updating_user_id=updating_user_id,
+            p_name=request.name,
+            p_description=request.description,
+            p_cover_image_url=str(request.cover_image_url) if request.cover_image_url else None,
+            p_icon_url=str(request.icon_url) if request.icon_url else None,
+            p_max_members=request.max_members,
+            p_tags=request.tags if hasattr(request, 'tags') else None
+        )
+        
+        return CommunityUpdateResponse(**results[0])
+    
+    # Implement remaining methods:
+    # - join_community
+    # - leave_community
+    # - get_members
+    # - search_communities
+```
+
+Implement ALL service methods matching the stored procedures.
+
+#### Step 6.2: app/services/post_service.py
+Implement all post-related service methods
+
+#### Step 6.3: app/services/comment_service.py
+Implement all comment-related service methods
+
+#### Step 6.4: app/services/reaction_service.py
+Implement all reaction-related service methods
+
+**Validation**: Should compile without errors
+
+---
+
+### PHASE 7: API Routes (2 hours)
+
+Implement ALL 20 endpoints from COMMUNITY_API_SPECIFICATIONS.md.
+
+#### Step 7.1: app/routes/communities.py (Endpoints E1-E7)
+
+```python
+from fastapi import APIRouter, Depends, Query, status
+from typing import Optional
+from uuid import UUID
+import structlog
+
+from app.core.auth import CurrentUser, get_current_user, get_current_user_optional
+from app.core.database import Database, get_db
+from app.services.community_service import CommunityService
+from app.models.community import (
+    CommunityCreateRequest,
+    CommunityCreateResponse,
+    CommunityUpdateRequest,
+    CommunityUpdateResponse,
+    CommunityDetailResponse,
+    CommunitySearchResponse,
+    MembershipCreateResponse,
+    MembershipLeaveResponse,
+    MemberListResponse,
+)
+
+logger = structlog.get_logger()
+router = APIRouter()
+
+def get_community_service(db: Database = Depends(get_db)) -> CommunityService:
+    return CommunityService(db)
+
+# E1: POST /api/v1/communities
+@router.post(
+    "",
+    response_model=CommunityCreateResponse,
+    status_code=status.HTTP_201_CREATED
+)
+async def create_community(
+    request: CommunityCreateRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: CommunityService = Depends(get_community_service)
+):
+    """Create a new community"""
+    return await service.create_community(
+        creator_user_id=UUID(current_user.user_id),
+        request=request
+    )
+
+# E2: GET /api/v1/communities/{community_id}
+@router.get(
+    "/{community_id}",
+    response_model=CommunityDetailResponse
+)
+async def get_community(
+    community_id: UUID,
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+    service: CommunityService = Depends(get_community_service)
+):
+    """Get community details"""
+    requesting_user_id = UUID(current_user.user_id) if current_user else None
+    
+    community = await service.get_community(
+        community_id=community_id,
+        requesting_user_id=requesting_user_id
+    )
+    
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+    
+    return community
+
+# E3: PATCH /api/v1/communities/{community_id}
+@router.patch(
+    "/{community_id}",
+    response_model=CommunityUpdateResponse
+)
+async def update_community(
+    community_id: UUID,
+    request: CommunityUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: CommunityService = Depends(get_community_service)
+):
+    """Update community details"""
+    return await service.update_community(
+        community_id=community_id,
+        updating_user_id=UUID(current_user.user_id),
+        request=request
+    )
+
+# E4: POST /api/v1/communities/{community_id}/join
+@router.post(
+    "/{community_id}/join",
+    response_model=MembershipCreateResponse,
+    status_code=status.HTTP_201_CREATED
+)
+async def join_community(
+    community_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: CommunityService = Depends(get_community_service)
+):
+    """Join a community"""
+    return await service.join_community(
+        community_id=community_id,
+        user_id=UUID(current_user.user_id)
+    )
+
+# Implement E5, E6, E7 following same pattern
+```
+
+#### Step 7.2: app/routes/posts.py (Endpoints E8-E11)
+Implement all post endpoints
+
+#### Step 7.3: app/routes/comments.py (Endpoints E12-E15)
+Implement all comment endpoints
+
+#### Step 7.4: app/routes/reactions.py (Endpoints E16-E19)
+Implement all reaction endpoints
+
+#### Step 7.5: app/routes/activity_links.py (Endpoint E20)
+Implement activity linking endpoint
+
+**Validation Checkpoint**: Run `uvicorn app.main:app --reload` - should start without errors
+
+---
+
+### PHASE 8: Rate Limiting (30 minutes)
+
+Add rate limiting to mutation endpoints using SlowAPI.
+
+Create `app/core/rate_limit.py`:
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from app.config import settings
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    enabled=settings.RATE_LIMIT_ENABLED
+)
+```
+
+Add to endpoints:
+```python
+from app.core.rate_limit import limiter
+
+@router.post("", ...)
+@limiter.limit("10/hour")
+async def create_community(...):
+    pass
+```
+
+Apply rate limits as specified in COMMUNITY_API_SPECIFICATIONS.md:
+- POST /communities: 10/hour
+- POST /join: 30/hour
+- POST /posts: 50/hour
+- POST /comments: 100/hour
+- POST /reactions: 200/hour
+- etc.
+
+---
+
+### PHASE 9: Docker Setup (20 minutes)
+
+#### Step 9.1: Create Dockerfile
+```dockerfile
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+
+RUN useradd -m -u 1000 appuser
+WORKDIR /app
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY . .
+
+USER appuser
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+#### Step 9.2: Create docker-compose.yml
+```yaml
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: activity_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/stored_procedures.sql:/docker-entrypoint-initdb.d/01-stored-procedures.sql
+  
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+**Validation**: Run `docker-compose up --build` - should start all services
+
+---
+
+### PHASE 10: Testing (1 hour)
+
+#### Step 10.1: Create tests/conftest.py
+```python
+import pytest
+import asyncio
+from httpx import AsyncClient
+from app.main import app
+from app.core.database import db
+
+@pytest.fixture(scope="session")
+def event_loop():
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest.fixture(scope="session")
+async def client():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        yield ac
+
+@pytest.fixture(scope="session", autouse=True)
+async def setup_database():
+    await db.connect()
+    yield
+    await db.disconnect()
+```
+
+#### Step 10.2: Create tests/test_communities.py
+```python
+import pytest
+from httpx import AsyncClient
+
+@pytest.mark.asyncio
+async def test_health_check(client: AsyncClient):
+    response = await client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+
+@pytest.mark.asyncio
+async def test_create_community(client: AsyncClient):
+    # Generate valid JWT token for testing
+    token = "test-token-here"
+    
+    response = await client.post(
+        "/api/v1/communities",
+        json={
+            "name": "Test Community",
+            "slug": "test-community",
+            "description": "Test Description",
+            "community_type": "open"
+        },
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    
+    assert response.status_code == 201
+    data = response.json()
+    assert "community_id" in data
+    assert data["slug"] == "test-community"
+
+# Add more tests for all endpoints
+```
+
+**Validation**: Run `pytest` - should pass basic tests
+
+---
+
+## FINAL VALIDATION CHECKLIST
+
+Before considering the build complete, verify:
+
+### Database Layer
+- [ ] All 18 stored procedures created in PostgreSQL
+- [ ] Each SP tested with success case
+- [ ] Each SP tested with all error cases
+- [ ] Error messages match ERROR_CODES exactly
+
+### API Layer
+- [ ] All 20 endpoints implemented
+- [ ] All endpoints call stored procedures (NO raw SQL)
+- [ ] All Pydantic models validate correctly
+- [ ] Rate limiting applied to mutation endpoints
+- [ ] Health check endpoint returns database status
+
+### Infrastructure
+- [ ] Correlation IDs in all log messages
+- [ ] Structured logging (JSON in production)
+- [ ] Database connection pooling works
+- [ ] Docker builds successfully
+- [ ] docker-compose starts all services
+
+### Testing
+- [ ] Can create community via API
+- [ ] Can join community via API
+- [ ] Can create post via API
+- [ ] Can create comment via API
+- [ ] Can create reaction via API
+- [ ] Error handling works (try invalid data)
+- [ ] Authentication works (try without token)
+- [ ] Rate limiting works (exceed limits)
+
+---
+
+## TROUBLESHOOTING GUIDE FOR AI AGENT
+
+### Problem: "Database connection failed"
+**Solution**: Check DATABASE_URL in .env, ensure PostgreSQL is running
+
+### Problem: "Stored procedure not found"
+**Solution**: Run `database/stored_procedures.sql` in PostgreSQL first
+
+### Problem: "JWT token invalid"
+**Solution**: Check JWT_SECRET_KEY matches auth-api, ensure token format correct
+
+### Problem: "Rate limit not working"
+**Solution**: Check REDIS_URL in .env, ensure Redis is running
+
+### Problem: "Pydantic validation error"
+**Solution**: Check request body matches exact schema, including field names and types
+
+### Problem: "CORS error in browser"
+**Solution**: Check CORSMiddleware configuration in main.py
+
+---
+
+## SUCCESS CRITERIA
+
+The build is complete when:
+
+1. ✅ `curl http://localhost:8000/health` returns `{"status":"ok","checks":{"api":"ok","database":"ok"}}`
+2. ✅ Can create community: `curl -X POST http://localhost:8000/api/v1/communities -H "Authorization: Bearer TOKEN" -d '{"name":"Test","slug":"test"}'`
+3. ✅ Can get community: `curl http://localhost:8000/api/v1/communities/{id}`
+4. ✅ All 20 endpoints return proper responses (not 500 errors)
+5. ✅ Rate limiting works (429 after exceeding limit)
+6. ✅ Error handling works (proper error codes and messages)
+7. ✅ Docker build succeeds: `docker-compose up --build`
+
+---
+
+## DEPLOYMENT NOTES
+
+After successful build:
+
+1. Update README.md with:
+   - API documentation
+   - Environment variables
+   - Setup instructions
+   - Example requests
+
+2. Create `.env.example` with all required variables
+
+3. Tag release: `git tag -a v1.0.0 -m "Community API v1.0.0"`
+
+4. Deploy to staging environment for integration testing
+
+---
+
+END OF BUILD INSTRUCTIONS
