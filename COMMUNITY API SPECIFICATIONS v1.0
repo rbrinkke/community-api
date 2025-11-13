@@ -1,0 +1,2646 @@
+# COMMUNITY API SPECIFICATIONS v1.0
+## Complete Technical Specification for AI Code Generation
+
+**API Type**: FastAPI (Python)  
+**Architecture**: Microservice with PostgreSQL stored procedures  
+**Authentication**: JWT Bearer tokens (via auth-api)  
+**Database Schema**: `activity.*`  
+**NO DIRECT DATABASE QUERIES - All operations via stored procedures**
+
+---
+
+## TABLE OF CONTENTS
+1. [Architecture Overview](#architecture-overview)
+2. [Authentication & Authorization](#authentication--authorization)
+3. [Stored Procedures Specification](#stored-procedures-specification)
+4. [API Endpoints Specification](#api-endpoints-specification)
+5. [Request/Response Schemas](#requestresponse-schemas)
+6. [Error Handling](#error-handling)
+7. [Business Rules](#business-rules)
+
+---
+
+## ARCHITECTURE OVERVIEW
+
+### Technology Stack
+- **Framework**: FastAPI 0.109+
+- **Database**: PostgreSQL 15+ (schema: `activity`)
+- **Authentication**: JWT Bearer tokens (validated via shared logic from auth-api)
+- **Rate Limiting**: Redis-based (SlowAPI)
+- **Validation**: Pydantic v2 models
+
+### Database Interaction Pattern
+```
+API Endpoint → Request Validation → Stored Procedure Call → Response Mapping
+```
+
+**CRITICAL**: The API NEVER writes raw SQL. All database operations use stored procedures.
+
+### Token Structure (From auth-api)
+```json
+{
+  "sub": "user_id (UUID)",
+  "email": "user@example.com",
+  "org_id": "org_id (UUID, optional)",
+  "subscription_level": "free|club|premium",
+  "ghost_mode": false,
+  "exp": 1704067200,
+  "iat": 1704066300,
+  "type": "access"
+}
+```
+
+**IMPORTANT**: subscription_level and ghost_mode are in token payload to avoid User Profile API calls.
+
+---
+
+## AUTHENTICATION & AUTHORIZATION
+
+### JWT Token Extraction
+Every protected endpoint requires:
+```
+Authorization: Bearer <access_token>
+```
+
+### Dependency Pattern
+```python
+# Token validation extracts:
+- user_id: UUID (from "sub" claim)
+- email: str
+- subscription_level: str ("free", "club", "premium")
+- ghost_mode: bool (default False if not present)
+```
+
+### Authorization Levels
+- **Public**: No token required
+- **Authenticated**: Valid token required
+- **Premium**: subscription_level in ["club", "premium"]
+- **Role-based**: Community role checks (organizer, co_organizer, member)
+
+---
+
+## STORED PROCEDURES SPECIFICATION
+
+All stored procedures follow naming convention: `sp_community_<action>`  
+All stored procedures are in schema: `activity`  
+All stored procedures return JSON or table results.
+
+---
+
+### SP1: sp_community_create
+
+**Purpose**: Create a new community (open type only for Phase 1)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_create(
+    p_creator_user_id UUID,
+    p_organization_id UUID,  -- NULL for personal communities
+    p_name VARCHAR(255),
+    p_slug VARCHAR(100),
+    p_description TEXT,
+    p_community_type activity.community_type,  -- 'open' only for Phase 1
+    p_cover_image_url VARCHAR(500),
+    p_icon_url VARCHAR(500),
+    p_max_members INT,
+    p_tags TEXT[]  -- Array of tag strings
+) RETURNS TABLE(
+    community_id UUID,
+    slug VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE,
+    member_count INT
+) AS $$
+```
+
+**Logic**:
+1. Validate creator_user_id exists in activity.users
+2. If organization_id provided, validate user is member of organization
+3. Validate slug uniqueness within organization (or globally if no org)
+4. Insert into activity.communities with status='active', member_count=1
+5. Insert creator as member in activity.community_members (role='organizer', status='active')
+6. If tags provided, insert into activity.community_tags
+7. Return community details
+
+**Error Cases**:
+- Invalid user_id → RAISE EXCEPTION 'USER_NOT_FOUND'
+- Invalid organization_id → RAISE EXCEPTION 'ORGANIZATION_NOT_FOUND'
+- User not org member → RAISE EXCEPTION 'NOT_ORGANIZATION_MEMBER'
+- Slug already exists → RAISE EXCEPTION 'SLUG_EXISTS'
+- Invalid community_type (not 'open') → RAISE EXCEPTION 'INVALID_COMMUNITY_TYPE'
+
+---
+
+### SP2: sp_community_get_by_id
+
+**Purpose**: Get community details by community_id
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_get_by_id(
+    p_community_id UUID,
+    p_requesting_user_id UUID  -- NULL for anonymous
+) RETURNS TABLE(
+    community_id UUID,
+    organization_id UUID,
+    creator_user_id UUID,
+    name VARCHAR(255),
+    slug VARCHAR(100),
+    description TEXT,
+    community_type activity.community_type,
+    status activity.community_status,
+    member_count INT,
+    max_members INT,
+    is_featured BOOLEAN,
+    cover_image_url VARCHAR(500),
+    icon_url VARCHAR(500),
+    created_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE,
+    -- User-specific fields
+    is_member BOOLEAN,
+    user_role activity.participant_role,  -- NULL if not member
+    user_status activity.membership_status,  -- NULL if not member
+    tags TEXT[]  -- Array of tags
+) AS $$
+```
+
+**Logic**:
+1. SELECT community from activity.communities WHERE community_id = p_community_id
+2. If requesting_user_id provided:
+   - LEFT JOIN activity.community_members to get user's membership status
+3. Get tags from activity.community_tags
+4. Return all fields
+
+**Error Cases**:
+- Community not found → Return empty result (NOT an exception)
+- Community archived/suspended → Return with status field (client decides visibility)
+
+---
+
+### SP3: sp_community_update
+
+**Purpose**: Update community details (organizer only)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_update(
+    p_community_id UUID,
+    p_updating_user_id UUID,
+    p_name VARCHAR(255),
+    p_description TEXT,
+    p_cover_image_url VARCHAR(500),
+    p_icon_url VARCHAR(500),
+    p_max_members INT,
+    p_tags TEXT[]  -- NULL = no change, empty array = clear all
+) RETURNS TABLE(
+    community_id UUID,
+    updated_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists and status='active'
+2. Check user is organizer: 
+   ```sql
+   SELECT 1 FROM activity.community_members 
+   WHERE community_id=p_community_id 
+   AND user_id=p_updating_user_id 
+   AND role='organizer' 
+   AND status='active'
+   ```
+3. UPDATE activity.communities SET [provided fields], updated_at=NOW()
+4. If p_tags IS NOT NULL:
+   - DELETE FROM activity.community_tags WHERE community_id=p_community_id
+   - If p_tags not empty, INSERT new tags
+5. Return updated community_id and updated_at
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- User not organizer → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+- Community not active → RAISE EXCEPTION 'COMMUNITY_NOT_ACTIVE'
+
+---
+
+### SP4: sp_community_join
+
+**Purpose**: Join an open community
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_join(
+    p_community_id UUID,
+    p_user_id UUID
+) RETURNS TABLE(
+    community_id UUID,
+    user_id UUID,
+    role activity.participant_role,
+    status activity.membership_status,
+    joined_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists, status='active', community_type='open'
+2. Check if max_members reached: member_count >= max_members
+3. Check user not already member (any status)
+4. INSERT INTO activity.community_members (status='active', role='member')
+5. UPDATE activity.communities SET member_count = member_count + 1
+6. Return membership details
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- Community full → RAISE EXCEPTION 'COMMUNITY_FULL'
+- Already member → RAISE EXCEPTION 'ALREADY_MEMBER'
+- Community not open type → RAISE EXCEPTION 'COMMUNITY_NOT_OPEN'
+
+---
+
+### SP5: sp_community_leave
+
+**Purpose**: Leave a community (cannot leave if organizer)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_leave(
+    p_community_id UUID,
+    p_user_id UUID
+) RETURNS TABLE(
+    community_id UUID,
+    user_id UUID,
+    left_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate membership exists and status='active'
+2. Check user is NOT organizer (organizers cannot leave)
+3. UPDATE activity.community_members SET status='left', left_at=NOW()
+4. UPDATE activity.communities SET member_count = member_count - 1
+5. Return leave confirmation
+
+**Error Cases**:
+- Not a member → RAISE EXCEPTION 'NOT_MEMBER'
+- User is organizer → RAISE EXCEPTION 'ORGANIZER_CANNOT_LEAVE'
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+
+---
+
+### SP6: sp_community_get_members
+
+**Purpose**: Get paginated list of community members
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_get_members(
+    p_community_id UUID,
+    p_requesting_user_id UUID,  -- For privacy checks
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE(
+    user_id UUID,
+    username VARCHAR(100),
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    main_photo_url VARCHAR(500),
+    role activity.participant_role,
+    status activity.membership_status,
+    joined_at TIMESTAMP WITH TIME ZONE,
+    is_verified BOOLEAN,
+    total_count BIGINT  -- Total members (for pagination)
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists
+2. Check requesting user has permission to view members (is member OR community is open)
+3. SELECT from activity.community_members cm 
+   JOIN activity.users u ON cm.user_id = u.user_id
+   WHERE cm.community_id = p_community_id AND cm.status = 'active'
+   ORDER BY cm.role DESC, cm.joined_at ASC
+4. Include COUNT(*) OVER() as total_count
+5. Apply LIMIT and OFFSET
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- No permission to view → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+
+---
+
+### SP7: sp_community_search
+
+**Purpose**: Search communities with filters
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_search(
+    p_search_text TEXT,  -- NULL = no text filter
+    p_organization_id UUID,  -- NULL = all orgs
+    p_tags TEXT[],  -- NULL = no tag filter
+    p_requesting_user_id UUID,  -- NULL for anonymous
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE(
+    community_id UUID,
+    organization_id UUID,
+    name VARCHAR(255),
+    slug VARCHAR(100),
+    description TEXT,
+    community_type activity.community_type,
+    member_count INT,
+    max_members INT,
+    is_featured BOOLEAN,
+    cover_image_url VARCHAR(500),
+    icon_url VARCHAR(500),
+    created_at TIMESTAMP WITH TIME ZONE,
+    is_member BOOLEAN,  -- TRUE if requesting_user_id is member
+    tags TEXT[],
+    total_count BIGINT
+) AS $$
+```
+
+**Logic**:
+1. SELECT from activity.communities c WHERE status = 'active'
+2. If p_search_text provided: 
+   ```sql
+   AND (c.name ILIKE '%' || p_search_text || '%' 
+        OR c.description ILIKE '%' || p_search_text || '%')
+   ```
+3. If p_organization_id provided: AND c.organization_id = p_organization_id
+4. If p_tags provided:
+   ```sql
+   AND EXISTS (
+     SELECT 1 FROM activity.community_tags ct 
+     WHERE ct.community_id = c.community_id 
+     AND ct.tag = ANY(p_tags)
+   )
+   ```
+5. If p_requesting_user_id provided:
+   - LEFT JOIN activity.community_members to set is_member flag
+6. LEFT JOIN activity.community_tags to aggregate tags as array
+7. ORDER BY is_featured DESC, member_count DESC, created_at DESC
+8. Include COUNT(*) OVER() as total_count
+9. Apply LIMIT and OFFSET
+
+**Error Cases**:
+- None (returns empty result if no matches)
+
+---
+
+### SP8: sp_community_post_create
+
+**Purpose**: Create a post in a community
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_post_create(
+    p_community_id UUID,
+    p_author_user_id UUID,
+    p_activity_id UUID,  -- NULL if not linked to activity
+    p_title VARCHAR(500),  -- NULL for posts without title
+    p_content TEXT,
+    p_content_type activity.content_type DEFAULT 'post'
+) RETURNS TABLE(
+    post_id UUID,
+    community_id UUID,
+    author_user_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE,
+    status activity.content_status
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists and status='active'
+2. Check user is active member:
+   ```sql
+   SELECT 1 FROM activity.community_members 
+   WHERE community_id=p_community_id 
+   AND user_id=p_author_user_id 
+   AND status='active'
+   ```
+3. If p_activity_id provided, validate activity exists
+4. INSERT INTO activity.posts (status='published', view_count=0, comment_count=0, reaction_count=0)
+5. Return post details
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- Not a member → RAISE EXCEPTION 'NOT_MEMBER'
+- Invalid activity_id → RAISE EXCEPTION 'ACTIVITY_NOT_FOUND'
+- Community not active → RAISE EXCEPTION 'COMMUNITY_NOT_ACTIVE'
+
+---
+
+### SP9: sp_community_post_update
+
+**Purpose**: Update own post (author only)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_post_update(
+    p_post_id UUID,
+    p_updating_user_id UUID,
+    p_title VARCHAR(500),
+    p_content TEXT
+) RETURNS TABLE(
+    post_id UUID,
+    updated_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate post exists and status='published'
+2. Check user is author:
+   ```sql
+   SELECT 1 FROM activity.posts 
+   WHERE post_id=p_post_id 
+   AND author_user_id=p_updating_user_id
+   ```
+3. UPDATE activity.posts SET title=p_title, content=p_content, updated_at=NOW()
+4. Return updated post_id and updated_at
+
+**Error Cases**:
+- Post not found → RAISE EXCEPTION 'POST_NOT_FOUND'
+- Not author → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+- Post not published → RAISE EXCEPTION 'POST_NOT_PUBLISHED'
+
+---
+
+### SP10: sp_community_post_delete
+
+**Purpose**: Delete own post (soft delete)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_post_delete(
+    p_post_id UUID,
+    p_deleting_user_id UUID
+) RETURNS TABLE(
+    post_id UUID,
+    deleted_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate post exists
+2. Check user is author OR community organizer:
+   ```sql
+   SELECT 1 FROM activity.posts p
+   WHERE p.post_id = p_post_id
+   AND (p.author_user_id = p_deleting_user_id
+        OR EXISTS (
+          SELECT 1 FROM activity.community_members cm
+          WHERE cm.community_id = p.community_id
+          AND cm.user_id = p_deleting_user_id
+          AND cm.role = 'organizer'
+          AND cm.status = 'active'
+        ))
+   ```
+3. UPDATE activity.posts SET status='removed', updated_at=NOW()
+4. Return deletion confirmation
+
+**Error Cases**:
+- Post not found → RAISE EXCEPTION 'POST_NOT_FOUND'
+- Insufficient permissions → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+
+---
+
+### SP11: sp_community_post_get_feed
+
+**Purpose**: Get paginated post feed for a community
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_post_get_feed(
+    p_community_id UUID,
+    p_requesting_user_id UUID,  -- NULL for anonymous
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE(
+    post_id UUID,
+    author_user_id UUID,
+    author_username VARCHAR(100),
+    author_first_name VARCHAR(100),
+    author_main_photo_url VARCHAR(500),
+    activity_id UUID,
+    title VARCHAR(500),
+    content TEXT,
+    content_type activity.content_type,
+    view_count INT,
+    comment_count INT,
+    reaction_count INT,
+    is_pinned BOOLEAN,
+    created_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists
+2. Check requesting user has permission (is member OR community is open)
+3. SELECT from activity.posts p
+   JOIN activity.users u ON p.author_user_id = u.user_id
+   WHERE p.community_id = p_community_id AND p.status = 'published'
+   ORDER BY p.is_pinned DESC, p.created_at DESC
+4. Include COUNT(*) OVER() as total_count
+5. Apply LIMIT and OFFSET
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- No permission → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+
+---
+
+### SP12: sp_community_comment_create
+
+**Purpose**: Create a comment on a post
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_comment_create(
+    p_post_id UUID,
+    p_author_user_id UUID,
+    p_parent_comment_id UUID,  -- NULL for top-level comment
+    p_content TEXT
+) RETURNS TABLE(
+    comment_id UUID,
+    post_id UUID,
+    parent_comment_id UUID,
+    author_user_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate post exists and status='published'
+2. Get community_id from post
+3. Check user is active member of community
+4. If p_parent_comment_id provided, validate parent comment exists and belongs to same post
+5. INSERT INTO activity.comments (is_deleted=FALSE, reaction_count=0)
+6. UPDATE activity.posts SET comment_count = comment_count + 1 WHERE post_id = p_post_id
+7. Return comment details
+
+**Error Cases**:
+- Post not found → RAISE EXCEPTION 'POST_NOT_FOUND'
+- Not a member → RAISE EXCEPTION 'NOT_MEMBER'
+- Invalid parent comment → RAISE EXCEPTION 'PARENT_COMMENT_NOT_FOUND'
+- Post not published → RAISE EXCEPTION 'POST_NOT_PUBLISHED'
+
+---
+
+### SP13: sp_community_comment_update
+
+**Purpose**: Update own comment
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_comment_update(
+    p_comment_id UUID,
+    p_updating_user_id UUID,
+    p_content TEXT
+) RETURNS TABLE(
+    comment_id UUID,
+    updated_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate comment exists and is_deleted=FALSE
+2. Check user is author
+3. UPDATE activity.comments SET content=p_content, updated_at=NOW()
+4. Return updated comment_id and updated_at
+
+**Error Cases**:
+- Comment not found → RAISE EXCEPTION 'COMMENT_NOT_FOUND'
+- Not author → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+- Comment deleted → RAISE EXCEPTION 'COMMENT_DELETED'
+
+---
+
+### SP14: sp_community_comment_delete
+
+**Purpose**: Delete own comment (soft delete)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_comment_delete(
+    p_comment_id UUID,
+    p_deleting_user_id UUID
+) RETURNS TABLE(
+    comment_id UUID,
+    deleted_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate comment exists
+2. Get post_id from comment
+3. Check user is author OR community organizer (similar to post delete)
+4. UPDATE activity.comments SET is_deleted=TRUE, updated_at=NOW()
+5. UPDATE activity.posts SET comment_count = comment_count - 1 WHERE post_id = [post_id]
+6. Return deletion confirmation
+
+**Error Cases**:
+- Comment not found → RAISE EXCEPTION 'COMMENT_NOT_FOUND'
+- Insufficient permissions → RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS'
+
+---
+
+### SP15: sp_community_post_get_comments
+
+**Purpose**: Get paginated comments for a post (threaded)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_post_get_comments(
+    p_post_id UUID,
+    p_parent_comment_id UUID,  -- NULL for top-level comments
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE(
+    comment_id UUID,
+    parent_comment_id UUID,
+    author_user_id UUID,
+    author_username VARCHAR(100),
+    author_first_name VARCHAR(100),
+    author_main_photo_url VARCHAR(500),
+    content TEXT,
+    reaction_count INT,
+    is_deleted BOOLEAN,
+    created_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+) AS $$
+```
+
+**Logic**:
+1. Validate post exists
+2. SELECT from activity.comments c
+   JOIN activity.users u ON c.author_user_id = u.user_id
+   WHERE c.post_id = p_post_id 
+   AND (c.parent_comment_id = p_parent_comment_id OR (c.parent_comment_id IS NULL AND p_parent_comment_id IS NULL))
+   ORDER BY c.created_at ASC
+3. Include COUNT(*) OVER() as total_count
+4. Apply LIMIT and OFFSET
+5. If is_deleted=TRUE, replace content with "[deleted]"
+
+**Error Cases**:
+- Post not found → RAISE EXCEPTION 'POST_NOT_FOUND'
+
+---
+
+### SP16: sp_community_reaction_create
+
+**Purpose**: Create or update reaction on post/comment
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_reaction_create(
+    p_user_id UUID,
+    p_target_type VARCHAR(50),  -- 'post' or 'comment'
+    p_target_id UUID,
+    p_reaction_type activity.reaction_type
+) RETURNS TABLE(
+    reaction_id UUID,
+    target_type VARCHAR(50),
+    target_id UUID,
+    reaction_type activity.reaction_type,
+    created_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate target exists (post or comment)
+2. Check if reaction already exists:
+   ```sql
+   SELECT reaction_id FROM activity.reactions 
+   WHERE user_id=p_user_id AND target_type=p_target_type AND target_id=p_target_id
+   ```
+3. If exists:
+   - If same reaction_type → do nothing (idempotent)
+   - If different reaction_type → UPDATE reaction_type
+4. If not exists:
+   - INSERT INTO activity.reactions
+   - UPDATE target table (posts or comments) SET reaction_count = reaction_count + 1
+5. Return reaction details
+
+**Error Cases**:
+- Invalid target_type → RAISE EXCEPTION 'INVALID_TARGET_TYPE'
+- Target not found → RAISE EXCEPTION 'TARGET_NOT_FOUND'
+
+---
+
+### SP17: sp_community_reaction_delete
+
+**Purpose**: Remove reaction from post/comment
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_reaction_delete(
+    p_user_id UUID,
+    p_target_type VARCHAR(50),
+    p_target_id UUID
+) RETURNS TABLE(
+    deleted BOOLEAN
+) AS $$
+```
+
+**Logic**:
+1. Check if reaction exists
+2. If exists:
+   - DELETE FROM activity.reactions
+   - UPDATE target table SET reaction_count = reaction_count - 1
+   - Return TRUE
+3. If not exists:
+   - Return FALSE (idempotent)
+
+**Error Cases**:
+- None (idempotent operation)
+
+---
+
+### SP18: sp_community_link_activity
+
+**Purpose**: Link an activity to a community (organizer of both required)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_community_link_activity(
+    p_community_id UUID,
+    p_activity_id UUID,
+    p_linking_user_id UUID
+) RETURNS TABLE(
+    community_id UUID,
+    activity_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE
+) AS $$
+```
+
+**Logic**:
+1. Validate community exists and status='active'
+2. Validate activity exists and status='published'
+3. Check user is organizer of community
+4. Check user is organizer of activity
+5. Check link doesn't already exist
+6. INSERT INTO activity.community_activities (is_pinned=FALSE)
+7. Return link details
+
+**Error Cases**:
+- Community not found → RAISE EXCEPTION 'COMMUNITY_NOT_FOUND'
+- Activity not found → RAISE EXCEPTION 'ACTIVITY_NOT_FOUND'
+- Not community organizer → RAISE EXCEPTION 'NOT_COMMUNITY_ORGANIZER'
+- Not activity organizer → RAISE EXCEPTION 'NOT_ACTIVITY_ORGANIZER'
+- Link already exists → RAISE EXCEPTION 'LINK_ALREADY_EXISTS'
+
+---
+
+## API ENDPOINTS SPECIFICATION
+
+### ENDPOINT PATTERN
+```
+Base URL: /api/v1/communities
+Authentication: JWT Bearer token via Authorization header
+Content-Type: application/json
+```
+
+---
+
+### E1: POST /api/v1/communities
+
+**Description**: Create a new community
+
+**Authentication**: Required
+
+**Rate Limit**: 10 requests/hour per user
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "organization_id": "uuid | null",
+  "name": "string (1-255 chars, required)",
+  "slug": "string (1-100 chars, lowercase-hyphenated, required)",
+  "description": "string (max 5000 chars, optional)",
+  "community_type": "open",
+  "cover_image_url": "string (valid URL, optional)",
+  "icon_url": "string (valid URL, optional)",
+  "max_members": "integer > 0 (optional)",
+  "tags": ["string", "string"]
+}
+```
+
+**Validation Rules**:
+- name: 1-255 characters, required
+- slug: 1-100 characters, lowercase, hyphens allowed, alphanumeric, required, regex: `^[a-z0-9-]+$`
+- description: max 5000 characters
+- community_type: MUST be "open" (Phase 1 restriction)
+- tags: max 20 tags, each tag max 100 characters
+- cover_image_url: valid URL format if provided
+- icon_url: valid URL format if provided
+- max_members: positive integer if provided
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_create",
+    p_creator_user_id=current_user.user_id,  # from JWT
+    p_organization_id=request.organization_id,
+    p_name=request.name,
+    p_slug=request.slug,
+    p_description=request.description,
+    p_community_type=request.community_type,
+    p_cover_image_url=request.cover_image_url,
+    p_icon_url=request.icon_url,
+    p_max_members=request.max_members,
+    p_tags=request.tags
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "community_id": "uuid",
+  "slug": "string",
+  "created_at": "2024-01-15T10:30:00Z",
+  "member_count": 1
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors (slug format, community_type not 'open')
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: NOT_ORGANIZATION_MEMBER
+- 404 Not Found: ORGANIZATION_NOT_FOUND
+- 409 Conflict: SLUG_EXISTS
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+**Error Response Format**:
+```json
+{
+  "detail": "Error message",
+  "error_code": "SLUG_EXISTS",
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+---
+
+### E2: GET /api/v1/communities/{community_id}
+
+**Description**: Get community details by ID
+
+**Authentication**: Optional (different response for authenticated users)
+
+**Rate Limit**: None
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token> (optional)
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_get_by_id",
+    p_community_id=community_id,
+    p_requesting_user_id=current_user.user_id if authenticated else None
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "community_id": "uuid",
+  "organization_id": "uuid | null",
+  "creator_user_id": "uuid",
+  "name": "string",
+  "slug": "string",
+  "description": "string",
+  "community_type": "open",
+  "status": "active | archived | suspended",
+  "member_count": 42,
+  "max_members": 100,
+  "is_featured": false,
+  "cover_image_url": "string | null",
+  "icon_url": "string | null",
+  "created_at": "2024-01-15T10:30:00Z",
+  "updated_at": "2024-01-15T10:30:00Z",
+  "is_member": false,
+  "user_role": "organizer | co_organizer | member | null",
+  "user_status": "active | pending | banned | left | null",
+  "tags": ["tag1", "tag2"]
+}
+```
+
+**Error Responses**:
+- 404 Not Found: Community not found
+- 500 Internal Server Error: Database error
+
+---
+
+### E3: PATCH /api/v1/communities/{community_id}
+
+**Description**: Update community details (organizer only)
+
+**Authentication**: Required
+
+**Rate Limit**: 20 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body** (all fields optional):
+```json
+{
+  "name": "string (1-255 chars)",
+  "description": "string (max 5000 chars)",
+  "cover_image_url": "string (valid URL)",
+  "icon_url": "string (valid URL)",
+  "max_members": "integer > 0",
+  "tags": ["string"]
+}
+```
+
+**Note on tags**:
+- If tags field is present (even as empty array), it REPLACES all existing tags
+- If tags field is absent (not in request body), tags are unchanged
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_update",
+    p_community_id=community_id,
+    p_updating_user_id=current_user.user_id,
+    p_name=request.name,
+    p_description=request.description,
+    p_cover_image_url=request.cover_image_url,
+    p_icon_url=request.icon_url,
+    p_max_members=request.max_members,
+    p_tags=request.tags if "tags" in request else None
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "community_id": "uuid",
+  "updated_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS (not organizer)
+- 404 Not Found: COMMUNITY_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E4: POST /api/v1/communities/{community_id}/join
+
+**Description**: Join an open community
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_join",
+    p_community_id=community_id,
+    p_user_id=current_user.user_id
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "community_id": "uuid",
+  "user_id": "uuid",
+  "role": "member",
+  "status": "active",
+  "joined_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: ALREADY_MEMBER
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: COMMUNITY_NOT_OPEN
+- 404 Not Found: COMMUNITY_NOT_FOUND
+- 409 Conflict: COMMUNITY_FULL
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E5: POST /api/v1/communities/{community_id}/leave
+
+**Description**: Leave a community (cannot leave if organizer)
+
+**Authentication**: Required
+
+**Rate Limit**: 20 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_leave",
+    p_community_id=community_id,
+    p_user_id=current_user.user_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "community_id": "uuid",
+  "user_id": "uuid",
+  "left_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: NOT_MEMBER
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: ORGANIZER_CANNOT_LEAVE
+- 404 Not Found: COMMUNITY_NOT_FOUND
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E6: GET /api/v1/communities/{community_id}/members
+
+**Description**: Get paginated list of community members
+
+**Authentication**: Required (or Optional if community is open - TBD by business rules)
+
+**Rate Limit**: None
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Query Parameters**:
+- limit: integer (1-100, default: 50)
+- offset: integer (>=0, default: 0)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_get_members",
+    p_community_id=community_id,
+    p_requesting_user_id=current_user.user_id,
+    p_limit=query_params.limit,
+    p_offset=query_params.offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "members": [
+    {
+      "user_id": "uuid",
+      "username": "string",
+      "first_name": "string",
+      "last_name": "string",
+      "main_photo_url": "string | null",
+      "role": "organizer | co_organizer | member",
+      "status": "active",
+      "joined_at": "2024-01-15T10:30:00Z",
+      "is_verified": true
+    }
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "total_count": 142
+  }
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS
+- 404 Not Found: COMMUNITY_NOT_FOUND
+- 500 Internal Server Error: Database error
+
+---
+
+### E7: GET /api/v1/communities/search
+
+**Description**: Search communities with filters
+
+**Authentication**: Optional
+
+**Rate Limit**: None
+
+**Query Parameters**:
+- q: string (search text, optional)
+- organization_id: UUID (optional)
+- tags: string[] (comma-separated, optional, example: "running,fitness")
+- limit: integer (1-100, default: 20)
+- offset: integer (>=0, default: 0)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token> (optional)
+```
+
+**Stored Procedure Call**:
+```python
+# Parse tags from comma-separated string to array
+tags_array = query_params.tags.split(',') if query_params.tags else None
+
+result = execute_stored_procedure(
+    "activity.sp_community_search",
+    p_search_text=query_params.q,
+    p_organization_id=query_params.organization_id,
+    p_tags=tags_array,
+    p_requesting_user_id=current_user.user_id if authenticated else None,
+    p_limit=query_params.limit,
+    p_offset=query_params.offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "communities": [
+    {
+      "community_id": "uuid",
+      "organization_id": "uuid | null",
+      "name": "string",
+      "slug": "string",
+      "description": "string",
+      "community_type": "open",
+      "member_count": 42,
+      "max_members": 100,
+      "is_featured": false,
+      "cover_image_url": "string | null",
+      "icon_url": "string | null",
+      "created_at": "2024-01-15T10:30:00Z",
+      "is_member": false,
+      "tags": ["tag1", "tag2"]
+    }
+  ],
+  "pagination": {
+    "limit": 20,
+    "offset": 0,
+    "total_count": 5
+  }
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Invalid query parameters
+- 500 Internal Server Error: Database error
+
+---
+
+### E8: POST /api/v1/communities/{community_id}/posts
+
+**Description**: Create a new post in a community
+
+**Authentication**: Required
+
+**Rate Limit**: 50 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "activity_id": "uuid | null",
+  "title": "string (max 500 chars, optional)",
+  "content": "string (1-10000 chars, required)",
+  "content_type": "post | photo | video | poll | event_announcement"
+}
+```
+
+**Validation Rules**:
+- content: 1-10000 characters, required
+- title: max 500 characters if provided
+- content_type: default 'post' if not provided
+- activity_id: must be valid UUID if provided
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_post_create",
+    p_community_id=community_id,
+    p_author_user_id=current_user.user_id,
+    p_activity_id=request.activity_id,
+    p_title=request.title,
+    p_content=request.content,
+    p_content_type=request.content_type or 'post'
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "post_id": "uuid",
+  "community_id": "uuid",
+  "author_user_id": "uuid",
+  "created_at": "2024-01-15T10:30:00Z",
+  "status": "published"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: NOT_MEMBER
+- 404 Not Found: COMMUNITY_NOT_FOUND, ACTIVITY_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E9: PATCH /api/v1/communities/{community_id}/posts/{post_id}
+
+**Description**: Update own post
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body** (all fields optional):
+```json
+{
+  "title": "string (max 500 chars)",
+  "content": "string (1-10000 chars)"
+}
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_post_update",
+    p_post_id=post_id,
+    p_updating_user_id=current_user.user_id,
+    p_title=request.title,
+    p_content=request.content
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "post_id": "uuid",
+  "updated_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS (not author)
+- 404 Not Found: POST_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E10: DELETE /api/v1/communities/{community_id}/posts/{post_id}
+
+**Description**: Delete own post (or organizer can delete any post)
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_post_delete",
+    p_post_id=post_id,
+    p_deleting_user_id=current_user.user_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "post_id": "uuid",
+  "deleted_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS
+- 404 Not Found: POST_NOT_FOUND
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E11: GET /api/v1/communities/{community_id}/posts
+
+**Description**: Get post feed for a community (paginated)
+
+**Authentication**: Required (or Optional if community is open - TBD)
+
+**Rate Limit**: None
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Query Parameters**:
+- limit: integer (1-100, default: 20)
+- offset: integer (>=0, default: 0)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_post_get_feed",
+    p_community_id=community_id,
+    p_requesting_user_id=current_user.user_id if authenticated else None,
+    p_limit=query_params.limit,
+    p_offset=query_params.offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "posts": [
+    {
+      "post_id": "uuid",
+      "author_user_id": "uuid",
+      "author_username": "string",
+      "author_first_name": "string",
+      "author_main_photo_url": "string | null",
+      "activity_id": "uuid | null",
+      "title": "string | null",
+      "content": "string",
+      "content_type": "post",
+      "view_count": 42,
+      "comment_count": 5,
+      "reaction_count": 12,
+      "is_pinned": false,
+      "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "pagination": {
+    "limit": 20,
+    "offset": 0,
+    "total_count": 87
+  }
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS
+- 404 Not Found: COMMUNITY_NOT_FOUND
+- 500 Internal Server Error: Database error
+
+---
+
+### E12: POST /api/v1/communities/{community_id}/posts/{post_id}/comments
+
+**Description**: Create a comment on a post
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "parent_comment_id": "uuid | null",
+  "content": "string (1-2000 chars, required)"
+}
+```
+
+**Validation Rules**:
+- content: 1-2000 characters, required
+- parent_comment_id: must be valid UUID if provided (for nested replies)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_comment_create",
+    p_post_id=post_id,
+    p_author_user_id=current_user.user_id,
+    p_parent_comment_id=request.parent_comment_id,
+    p_content=request.content
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "comment_id": "uuid",
+  "post_id": "uuid",
+  "parent_comment_id": "uuid | null",
+  "author_user_id": "uuid",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors, PARENT_COMMENT_NOT_FOUND
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: NOT_MEMBER
+- 404 Not Found: POST_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E13: PATCH /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}
+
+**Description**: Update own comment
+
+**Authentication**: Required
+
+**Rate Limit**: 50 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+- comment_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "content": "string (1-2000 chars, required)"
+}
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_comment_update",
+    p_comment_id=comment_id,
+    p_updating_user_id=current_user.user_id,
+    p_content=request.content
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "comment_id": "uuid",
+  "updated_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Validation errors
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS (not author)
+- 404 Not Found: COMMENT_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E14: DELETE /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}
+
+**Description**: Delete own comment (or organizer can delete any comment)
+
+**Authentication**: Required
+
+**Rate Limit**: 50 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+- comment_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_comment_delete",
+    p_comment_id=comment_id,
+    p_deleting_user_id=current_user.user_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "comment_id": "uuid",
+  "deleted_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: INSUFFICIENT_PERMISSIONS
+- 404 Not Found: COMMENT_NOT_FOUND
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E15: GET /api/v1/communities/{community_id}/posts/{post_id}/comments
+
+**Description**: Get comments for a post (paginated, threaded)
+
+**Authentication**: Required (or Optional if community is open - TBD)
+
+**Rate Limit**: None
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Query Parameters**:
+- parent_comment_id: UUID (optional, null for top-level comments)
+- limit: integer (1-200, default: 50)
+- offset: integer (>=0, default: 0)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_post_get_comments",
+    p_post_id=post_id,
+    p_parent_comment_id=query_params.parent_comment_id,
+    p_limit=query_params.limit,
+    p_offset=query_params.offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "comments": [
+    {
+      "comment_id": "uuid",
+      "parent_comment_id": "uuid | null",
+      "author_user_id": "uuid",
+      "author_username": "string",
+      "author_first_name": "string",
+      "author_main_photo_url": "string | null",
+      "content": "string",
+      "reaction_count": 3,
+      "is_deleted": false,
+      "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "total_count": 23
+  }
+}
+```
+
+**Note**: If is_deleted=true, content will be "[deleted]"
+
+**Error Responses**:
+- 404 Not Found: POST_NOT_FOUND
+- 500 Internal Server Error: Database error
+
+---
+
+### E16: POST /api/v1/communities/{community_id}/posts/{post_id}/reactions
+
+**Description**: React to a post (create or update reaction)
+
+**Authentication**: Required
+
+**Rate Limit**: 200 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "reaction_type": "like | love | celebrate | support | insightful"
+}
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_reaction_create",
+    p_user_id=current_user.user_id,
+    p_target_type='post',
+    p_target_id=post_id,
+    p_reaction_type=request.reaction_type
+)
+```
+
+**Success Response (201 Created or 200 OK)**:
+```json
+{
+  "reaction_id": "uuid",
+  "target_type": "post",
+  "target_id": "uuid",
+  "reaction_type": "like",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Note**: Idempotent operation - same reaction returns existing, different reaction updates
+
+**Error Responses**:
+- 400 Bad Request: Invalid reaction_type
+- 401 Unauthorized: Invalid or missing token
+- 404 Not Found: TARGET_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E17: DELETE /api/v1/communities/{community_id}/posts/{post_id}/reactions
+
+**Description**: Remove reaction from a post
+
+**Authentication**: Required
+
+**Rate Limit**: 200 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_reaction_delete",
+    p_user_id=current_user.user_id,
+    p_target_type='post',
+    p_target_id=post_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "deleted": true
+}
+```
+
+**Note**: Idempotent operation - returns deleted=false if no reaction existed
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E18: POST /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}/reactions
+
+**Description**: React to a comment
+
+**Authentication**: Required
+
+**Rate Limit**: 200 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+- comment_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "reaction_type": "like | love | celebrate | support | insightful"
+}
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_reaction_create",
+    p_user_id=current_user.user_id,
+    p_target_type='comment',
+    p_target_id=comment_id,
+    p_reaction_type=request.reaction_type
+)
+```
+
+**Success Response (201 Created or 200 OK)**:
+```json
+{
+  "reaction_id": "uuid",
+  "target_type": "comment",
+  "target_id": "uuid",
+  "reaction_type": "love",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request: Invalid reaction_type
+- 401 Unauthorized: Invalid or missing token
+- 404 Not Found: TARGET_NOT_FOUND
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E19: DELETE /api/v1/communities/{community_id}/posts/{post_id}/comments/{comment_id}/reactions
+
+**Description**: Remove reaction from a comment
+
+**Authentication**: Required
+
+**Rate Limit**: 200 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+- post_id: UUID (required)
+- comment_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+```
+
+**Request Body**: None (empty)
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_reaction_delete",
+    p_user_id=current_user.user_id,
+    p_target_type='comment',
+    p_target_id=comment_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "deleted": true
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+### E20: POST /api/v1/communities/{community_id}/activities
+
+**Description**: Link an activity to a community (both organizers required)
+
+**Authentication**: Required
+
+**Rate Limit**: 20 requests/hour per user
+
+**Path Parameters**:
+- community_id: UUID (required)
+
+**Request Headers**:
+```
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request Body**:
+```json
+{
+  "activity_id": "uuid (required)"
+}
+```
+
+**Stored Procedure Call**:
+```python
+result = execute_stored_procedure(
+    "activity.sp_community_link_activity",
+    p_community_id=community_id,
+    p_activity_id=request.activity_id,
+    p_linking_user_id=current_user.user_id
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "community_id": "uuid",
+  "activity_id": "uuid",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+- 401 Unauthorized: Invalid or missing token
+- 403 Forbidden: NOT_COMMUNITY_ORGANIZER, NOT_ACTIVITY_ORGANIZER
+- 404 Not Found: COMMUNITY_NOT_FOUND, ACTIVITY_NOT_FOUND
+- 409 Conflict: LINK_ALREADY_EXISTS
+- 422 Unprocessable Entity: Pydantic validation errors
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Database error
+
+---
+
+## REQUEST/RESPONSE SCHEMAS
+
+All schemas use Pydantic v2 models.
+
+### Common Response Models
+
+```python
+# Pagination response wrapper
+class PaginationMeta(BaseModel):
+    limit: int
+    offset: int
+    total_count: int
+
+# Generic error response
+class ErrorResponse(BaseModel):
+    detail: str
+    error_code: str | None = None
+    timestamp: datetime
+```
+
+### Community Schemas
+
+```python
+# Request: Create community
+class CommunityCreateRequest(BaseModel):
+    organization_id: UUID | None = None
+    name: str = Field(..., min_length=1, max_length=255)
+    slug: str = Field(..., min_length=1, max_length=100, pattern=r'^[a-z0-9-]+$')
+    description: str | None = Field(None, max_length=5000)
+    community_type: Literal['open'] = 'open'  # Phase 1 restriction
+    cover_image_url: HttpUrl | None = None
+    icon_url: HttpUrl | None = None
+    max_members: int | None = Field(None, gt=0)
+    tags: list[str] | None = Field(None, max_length=20)
+    
+    @field_validator('tags')
+    def validate_tags(cls, v):
+        if v:
+            for tag in v:
+                if len(tag) > 100:
+                    raise ValueError('Each tag must be max 100 characters')
+        return v
+
+# Response: Community created
+class CommunityCreateResponse(BaseModel):
+    community_id: UUID
+    slug: str
+    created_at: datetime
+    member_count: int
+
+# Request: Update community
+class CommunityUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=255)
+    description: str | None = Field(None, max_length=5000)
+    cover_image_url: HttpUrl | None = None
+    icon_url: HttpUrl | None = None
+    max_members: int | None = Field(None, gt=0)
+    tags: list[str] | None = None  # None = no change, [] = clear all
+
+# Response: Community updated
+class CommunityUpdateResponse(BaseModel):
+    community_id: UUID
+    updated_at: datetime
+
+# Response: Community details
+class CommunityDetailResponse(BaseModel):
+    community_id: UUID
+    organization_id: UUID | None
+    creator_user_id: UUID
+    name: str
+    slug: str
+    description: str | None
+    community_type: str
+    status: str
+    member_count: int
+    max_members: int | None
+    is_featured: bool
+    cover_image_url: str | None
+    icon_url: str | None
+    created_at: datetime
+    updated_at: datetime
+    is_member: bool
+    user_role: str | None
+    user_status: str | None
+    tags: list[str]
+
+# Response: Community list item (for search)
+class CommunityListItem(BaseModel):
+    community_id: UUID
+    organization_id: UUID | None
+    name: str
+    slug: str
+    description: str | None
+    community_type: str
+    member_count: int
+    max_members: int | None
+    is_featured: bool
+    cover_image_url: str | None
+    icon_url: str | None
+    created_at: datetime
+    is_member: bool
+    tags: list[str]
+
+# Response: Community search results
+class CommunitySearchResponse(BaseModel):
+    communities: list[CommunityListItem]
+    pagination: PaginationMeta
+```
+
+### Membership Schemas
+
+```python
+# Response: Join community
+class MembershipCreateResponse(BaseModel):
+    community_id: UUID
+    user_id: UUID
+    role: str
+    status: str
+    joined_at: datetime
+
+# Response: Leave community
+class MembershipLeaveResponse(BaseModel):
+    community_id: UUID
+    user_id: UUID
+    left_at: datetime
+
+# Response: Member list item
+class MemberListItem(BaseModel):
+    user_id: UUID
+    username: str
+    first_name: str | None
+    last_name: str | None
+    main_photo_url: str | None
+    role: str
+    status: str
+    joined_at: datetime
+    is_verified: bool
+
+# Response: Member list
+class MemberListResponse(BaseModel):
+    members: list[MemberListItem]
+    pagination: PaginationMeta
+```
+
+### Post Schemas
+
+```python
+# Request: Create post
+class PostCreateRequest(BaseModel):
+    activity_id: UUID | None = None
+    title: str | None = Field(None, max_length=500)
+    content: str = Field(..., min_length=1, max_length=10000)
+    content_type: Literal['post', 'photo', 'video', 'poll', 'event_announcement'] = 'post'
+
+# Response: Post created
+class PostCreateResponse(BaseModel):
+    post_id: UUID
+    community_id: UUID
+    author_user_id: UUID
+    created_at: datetime
+    status: str
+
+# Request: Update post
+class PostUpdateRequest(BaseModel):
+    title: str | None = Field(None, max_length=500)
+    content: str | None = Field(None, min_length=1, max_length=10000)
+
+# Response: Post updated
+class PostUpdateResponse(BaseModel):
+    post_id: UUID
+    updated_at: datetime
+
+# Response: Post deleted
+class PostDeleteResponse(BaseModel):
+    post_id: UUID
+    deleted_at: datetime
+
+# Response: Post list item
+class PostListItem(BaseModel):
+    post_id: UUID
+    author_user_id: UUID
+    author_username: str
+    author_first_name: str | None
+    author_main_photo_url: str | None
+    activity_id: UUID | None
+    title: str | None
+    content: str
+    content_type: str
+    view_count: int
+    comment_count: int
+    reaction_count: int
+    is_pinned: bool
+    created_at: datetime
+    updated_at: datetime
+
+# Response: Post feed
+class PostFeedResponse(BaseModel):
+    posts: list[PostListItem]
+    pagination: PaginationMeta
+```
+
+### Comment Schemas
+
+```python
+# Request: Create comment
+class CommentCreateRequest(BaseModel):
+    parent_comment_id: UUID | None = None
+    content: str = Field(..., min_length=1, max_length=2000)
+
+# Response: Comment created
+class CommentCreateResponse(BaseModel):
+    comment_id: UUID
+    post_id: UUID
+    parent_comment_id: UUID | None
+    author_user_id: UUID
+    created_at: datetime
+
+# Request: Update comment
+class CommentUpdateRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2000)
+
+# Response: Comment updated
+class CommentUpdateResponse(BaseModel):
+    comment_id: UUID
+    updated_at: datetime
+
+# Response: Comment deleted
+class CommentDeleteResponse(BaseModel):
+    comment_id: UUID
+    deleted_at: datetime
+
+# Response: Comment list item
+class CommentListItem(BaseModel):
+    comment_id: UUID
+    parent_comment_id: UUID | None
+    author_user_id: UUID
+    author_username: str
+    author_first_name: str | None
+    author_main_photo_url: str | None
+    content: str
+    reaction_count: int
+    is_deleted: bool
+    created_at: datetime
+    updated_at: datetime
+
+# Response: Comment list
+class CommentListResponse(BaseModel):
+    comments: list[CommentListItem]
+    pagination: PaginationMeta
+```
+
+### Reaction Schemas
+
+```python
+# Request: Create/update reaction
+class ReactionCreateRequest(BaseModel):
+    reaction_type: Literal['like', 'love', 'celebrate', 'support', 'insightful']
+
+# Response: Reaction created/updated
+class ReactionCreateResponse(BaseModel):
+    reaction_id: UUID
+    target_type: str
+    target_id: UUID
+    reaction_type: str
+    created_at: datetime
+
+# Response: Reaction deleted
+class ReactionDeleteResponse(BaseModel):
+    deleted: bool
+```
+
+### Activity Linking Schemas
+
+```python
+# Request: Link activity to community
+class CommunityActivityLinkRequest(BaseModel):
+    activity_id: UUID
+
+# Response: Activity linked
+class CommunityActivityLinkResponse(BaseModel):
+    community_id: UUID
+    activity_id: UUID
+    created_at: datetime
+```
+
+---
+
+## ERROR HANDLING
+
+### Error Response Structure
+
+All errors return consistent JSON structure:
+
+```json
+{
+  "detail": "Human-readable error message",
+  "error_code": "MACHINE_READABLE_CODE",
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+### HTTP Status Codes
+
+- **200 OK**: Successful GET/PATCH/DELETE
+- **201 Created**: Successful POST
+- **400 Bad Request**: Business logic errors (validation passed but operation invalid)
+- **401 Unauthorized**: Missing or invalid JWT token
+- **403 Forbidden**: Valid token but insufficient permissions
+- **404 Not Found**: Resource does not exist
+- **409 Conflict**: Resource conflict (e.g., duplicate slug, already member)
+- **422 Unprocessable Entity**: Pydantic validation errors
+- **429 Too Many Requests**: Rate limit exceeded
+- **500 Internal Server Error**: Database error or unexpected exception
+
+### Error Codes (Machine-readable)
+
+```python
+# User/Auth errors
+USER_NOT_FOUND = "USER_NOT_FOUND"
+INSUFFICIENT_PERMISSIONS = "INSUFFICIENT_PERMISSIONS"
+
+# Community errors
+COMMUNITY_NOT_FOUND = "COMMUNITY_NOT_FOUND"
+COMMUNITY_NOT_ACTIVE = "COMMUNITY_NOT_ACTIVE"
+SLUG_EXISTS = "SLUG_EXISTS"
+INVALID_COMMUNITY_TYPE = "INVALID_COMMUNITY_TYPE"
+COMMUNITY_FULL = "COMMUNITY_FULL"
+COMMUNITY_NOT_OPEN = "COMMUNITY_NOT_OPEN"
+
+# Membership errors
+NOT_MEMBER = "NOT_MEMBER"
+ALREADY_MEMBER = "ALREADY_MEMBER"
+ORGANIZER_CANNOT_LEAVE = "ORGANIZER_CANNOT_LEAVE"
+NOT_COMMUNITY_ORGANIZER = "NOT_COMMUNITY_ORGANIZER"
+
+# Organization errors
+ORGANIZATION_NOT_FOUND = "ORGANIZATION_NOT_FOUND"
+NOT_ORGANIZATION_MEMBER = "NOT_ORGANIZATION_MEMBER"
+
+# Post errors
+POST_NOT_FOUND = "POST_NOT_FOUND"
+POST_NOT_PUBLISHED = "POST_NOT_PUBLISHED"
+
+# Comment errors
+COMMENT_NOT_FOUND = "COMMENT_NOT_FOUND"
+COMMENT_DELETED = "COMMENT_DELETED"
+PARENT_COMMENT_NOT_FOUND = "PARENT_COMMENT_NOT_FOUND"
+
+# Activity errors
+ACTIVITY_NOT_FOUND = "ACTIVITY_NOT_FOUND"
+NOT_ACTIVITY_ORGANIZER = "NOT_ACTIVITY_ORGANIZER"
+LINK_ALREADY_EXISTS = "LINK_ALREADY_EXISTS"
+
+# Reaction errors
+INVALID_TARGET_TYPE = "INVALID_TARGET_TYPE"
+TARGET_NOT_FOUND = "TARGET_NOT_FOUND"
+```
+
+### Exception Handling Pattern
+
+```python
+# In stored procedure: RAISE EXCEPTION 'ERROR_CODE'
+# In API:
+try:
+    result = execute_stored_procedure(...)
+except DatabaseError as e:
+    # Parse error message from stored procedure
+    error_code = parse_error_code(str(e))
+    
+    # Map to HTTP status
+    status_code_map = {
+        'USER_NOT_FOUND': 404,
+        'INSUFFICIENT_PERMISSIONS': 403,
+        'SLUG_EXISTS': 409,
+        'ALREADY_MEMBER': 400,
+        # ... etc
+    }
+    
+    status_code = status_code_map.get(error_code, 500)
+    
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "detail": get_error_message(error_code),
+            "error_code": error_code,
+            "timestamp": datetime.utcnow()
+        }
+    )
+```
+
+### Pydantic Validation Errors (422)
+
+FastAPI automatically handles Pydantic validation errors:
+
+```json
+{
+  "detail": [
+    {
+      "type": "string_too_short",
+      "loc": ["body", "name"],
+      "msg": "String should have at least 1 character",
+      "input": "",
+      "ctx": {"min_length": 1}
+    }
+  ]
+}
+```
+
+### Rate Limit Errors (429)
+
+```json
+{
+  "error": "Rate limit exceeded",
+  "retry_after": 3600,
+  "limit": 10,
+  "window": "1 hour"
+}
+```
+
+---
+
+## BUSINESS RULES
+
+### Community Rules
+
+1. **Phase 1 Restriction**: Only 'open' community type allowed
+2. **Slug Uniqueness**: Slugs must be unique within organization (or globally if no org)
+3. **Member Limits**: Community respects max_members if set
+4. **Organizer Cannot Leave**: Community organizer cannot leave (must transfer ownership first - not in Phase 1)
+5. **Member Requirements**: Must be active member to post, comment, or react
+
+### Post & Comment Rules
+
+1. **Member-only**: Only active community members can post/comment
+2. **Author Permissions**: Only author can edit their own content
+3. **Organizer Permissions**: Community organizer can delete any post/comment
+4. **Soft Deletes**: Posts and comments are soft-deleted (status changed, not removed)
+5. **Deleted Comment Display**: Deleted comments show "[deleted]" content
+
+### Reaction Rules
+
+1. **One Reaction per Target**: User can have max 1 reaction per post/comment
+2. **Idempotent Operations**: Same reaction = no change, different reaction = update
+3. **Reaction Types**: like, love, celebrate, support, insightful
+
+### Activity Linking Rules
+
+1. **Dual Organizer Required**: User must be organizer of BOTH community and activity
+2. **No Duplicate Links**: Same activity cannot be linked twice to same community
+3. **Active Resources Only**: Both community and activity must be active/published
+
+### Pagination Rules
+
+1. **Default Limits**: 20 for posts/communities, 50 for members/comments
+2. **Max Limits**: 100 for general lists, 200 for comments
+3. **Offset-based**: Simple offset pagination (no cursor pagination in Phase 1)
+
+---
+
+## IMPLEMENTATION NOTES FOR AI CODE AGENT
+
+### Database Connection Pattern
+
+```python
+# Use connection pool from config
+from app.core.database import get_db_connection
+
+async def execute_stored_procedure(proc_name: str, **kwargs):
+    async with get_db_connection() as conn:
+        # Call stored procedure with parameters
+        result = await conn.fetch(f"SELECT * FROM {proc_name}(...)")
+        return result
+```
+
+### JWT Token Extraction Pattern
+
+```python
+from fastapi import Depends
+from app.core.auth import get_current_user
+
+@router.post("/communities")
+async def create_community(
+    request: CommunityCreateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    # current_user contains: user_id, email, subscription_level, ghost_mode
+    user_id = current_user['user_id']
+```
+
+### Rate Limiting Pattern
+
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+
+@router.post("/communities")
+@limiter.limit("10/hour")
+async def create_community(...):
+    pass
+```
+
+### Error Mapping Pattern
+
+```python
+ERROR_STATUS_MAP = {
+    'USER_NOT_FOUND': 404,
+    'COMMUNITY_NOT_FOUND': 404,
+    'POST_NOT_FOUND': 404,
+    'INSUFFICIENT_PERMISSIONS': 403,
+    'NOT_MEMBER': 403,
+    'SLUG_EXISTS': 409,
+    'ALREADY_MEMBER': 400,
+    'COMMUNITY_FULL': 409,
+    # ... all error codes
+}
+
+ERROR_MESSAGES = {
+    'USER_NOT_FOUND': 'User not found',
+    'COMMUNITY_NOT_FOUND': 'Community not found',
+    # ... all error messages
+}
+```
+
+### Response Transformation Pattern
+
+```python
+# Stored procedure returns table rows
+# Transform to Pydantic model
+def map_community_row(row) -> CommunityDetailResponse:
+    return CommunityDetailResponse(
+        community_id=row['community_id'],
+        organization_id=row['organization_id'],
+        # ... map all fields
+    )
+```
+
+### Pagination Helper Pattern
+
+```python
+def build_pagination_response(items: list, total_count: int, limit: int, offset: int):
+    return {
+        "items": items,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "total_count": total_count
+        }
+    }
+```
+
+### Query Parameter Parsing Pattern
+
+```python
+from fastapi import Query
+
+@router.get("/communities/search")
+async def search_communities(
+    q: str | None = Query(None, description="Search text"),
+    tags: str | None = Query(None, description="Comma-separated tags"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    # Parse tags: "tag1,tag2,tag3" -> ["tag1", "tag2", "tag3"]
+    tags_array = tags.split(',') if tags else None
+```
+
+---
+
+## FILE STRUCTURE FOR AI CODE AGENT
+
+```
+community-api/
+├── app/
+│   ├── __init__.py
+│   ├── main.py                      # FastAPI app initialization
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── config.py                # Environment configuration
+│   │   ├── database.py              # PostgreSQL connection pool
+│   │   ├── auth.py                  # JWT token validation (shared with auth-api)
+│   │   └── errors.py                # Error handling utilities
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── community.py             # Community Pydantic models
+│   │   ├── post.py                  # Post Pydantic models
+│   │   ├── comment.py               # Comment Pydantic models
+│   │   ├── reaction.py              # Reaction Pydantic models
+│   │   └── common.py                # Shared models (pagination, errors)
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   ├── communities.py           # E1-E7 endpoints
+│   │   ├── posts.py                 # E8-E11 endpoints
+│   │   ├── comments.py              # E12-E15 endpoints
+│   │   ├── reactions.py             # E16-E19 endpoints
+│   │   └── activity_links.py        # E20 endpoint
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── community_service.py     # Business logic for communities
+│   │   ├── post_service.py          # Business logic for posts
+│   │   ├── comment_service.py       # Business logic for comments
+│   │   └── reaction_service.py      # Business logic for reactions
+│   └── utils/
+│       ├── __init__.py
+│       ├── stored_procedures.py     # SP execution helpers
+│       └── pagination.py            # Pagination helpers
+├── tests/
+│   ├── __init__.py
+│   ├── test_communities.py
+│   ├── test_posts.py
+│   ├── test_comments.py
+│   └── test_reactions.py
+├── requirements.txt
+├── Dockerfile
+└── README.md
+```
+
+---
+
+## CRITICAL REMINDERS FOR AI CODE AGENT
+
+1. **NO DIRECT SQL**: All database operations MUST use stored procedures
+2. **JWT Claims**: subscription_level and ghost_mode are in token payload
+3. **Error Codes**: ALWAYS use error codes from stored procedure RAISE EXCEPTION
+4. **Idempotency**: Reactions are idempotent (same reaction = no error)
+5. **Soft Deletes**: Posts/comments are soft-deleted (status='removed', is_deleted=TRUE)
+6. **Rate Limits**: Apply to mutation endpoints (POST/PATCH/DELETE), not GET
+7. **Pagination**: Always include total_count from stored procedure
+8. **Tags Handling**: Empty array = clear all, None = no change
+9. **Phase 1 Only**: Community type MUST be 'open'
+10. **Organizer Check**: Many operations require organizer role validation
+
+---
+
+## TESTING STRATEGY FOR AI CODE AGENT
+
+### Unit Tests
+- Test Pydantic model validation
+- Test error code mapping
+- Test pagination helpers
+
+### Integration Tests
+- Mock stored procedure calls
+- Test endpoint request/response flow
+- Test JWT token extraction
+- Test error handling
+
+### End-to-End Tests
+- Require actual PostgreSQL database with stored procedures
+- Test full API workflows:
+  1. Create community → Join → Post → Comment → React
+  2. Search communities → Get details → Get members
+  3. Permission checks (non-member tries to post)
+  4. Organizer operations (delete posts, update community)
+
+---
+
+## API DEPENDENCIES
+
+### Required Services
+- **auth-api**: JWT token generation/validation logic (shared)
+- **PostgreSQL**: Database with activity schema + stored procedures
+- **Redis**: Rate limiting storage
+
+### Optional Integrations (Future)
+- **image-api**: For validating cover_image_url and icon_url
+- **email-api**: For community invitation emails (Phase 2)
+- **notifications-api**: For community activity notifications (Phase 2)
+
+---
+
+END OF SPECIFICATION DOCUMENT
