@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, Request
 from uuid import UUID
 import structlog
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import Database, get_db
+from app.core.rate_limit import limiter
 from app.services.reaction_service import ReactionService
 from app.models.reaction import (
     ReactionCreateRequest,
@@ -23,7 +24,9 @@ def get_reaction_service(db: Database = Depends(get_db)) -> ReactionService:
     response_model=ReactionCreateResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("200/hour")
 async def create_post_reaction(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     request: ReactionCreateRequest,
@@ -43,7 +46,9 @@ async def create_post_reaction(
     "/{community_id}/posts/{post_id}/reactions",
     response_model=ReactionDeleteResponse
 )
+@limiter.limit("200/hour")
 async def delete_post_reaction(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -62,7 +67,9 @@ async def delete_post_reaction(
     response_model=ReactionCreateResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("200/hour")
 async def create_comment_reaction(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
@@ -83,7 +90,9 @@ async def create_comment_reaction(
     "/{community_id}/posts/{post_id}/comments/{comment_id}/reactions",
     response_model=ReactionDeleteResponse
 )
+@limiter.limit("200/hour")
 async def delete_comment_reaction(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,

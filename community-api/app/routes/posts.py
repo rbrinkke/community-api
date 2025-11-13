@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status, Request
 from typing import Optional
 from uuid import UUID
 import structlog
 
 from app.core.auth import CurrentUser, get_current_user, get_current_user_optional
 from app.core.database import Database, get_db
+from app.core.rate_limit import limiter
 from app.services.post_service import PostService
 from app.models.post import (
     PostCreateRequest,
@@ -28,7 +29,9 @@ def get_post_service(db: Database = Depends(get_db)) -> PostService:
     response_model=PostCreateResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("50/hour")
 async def create_post(
+    req: Request,
     community_id: UUID,
     request: PostCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
@@ -46,7 +49,9 @@ async def create_post(
     "/{community_id}/posts/{post_id}",
     response_model=PostUpdateResponse
 )
+@limiter.limit("30/hour")
 async def update_post(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     request: PostUpdateRequest,
@@ -65,7 +70,9 @@ async def update_post(
     "/{community_id}/posts/{post_id}",
     response_model=PostDeleteResponse
 )
+@limiter.limit("30/hour")
 async def delete_post(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),

@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, Request
 from uuid import UUID
 import structlog
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import Database, get_db
+from app.core.rate_limit import limiter
 from app.services.reaction_service import ReactionService
 from app.models.reaction import (
     CommunityActivityLinkRequest,
@@ -22,7 +23,9 @@ def get_reaction_service(db: Database = Depends(get_db)) -> ReactionService:
     response_model=CommunityActivityLinkResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("20/hour")
 async def link_activity_to_community(
+    req: Request,
     community_id: UUID,
     request: CommunityActivityLinkRequest,
     current_user: CurrentUser = Depends(get_current_user),

@@ -73,7 +73,9 @@ async def get_community(
     "/{community_id}",
     response_model=CommunityUpdateResponse
 )
+@limiter.limit("20/hour")
 async def update_community(
+    req: Request,
     community_id: UUID,
     request: CommunityUpdateRequest,
     current_user: CurrentUser = Depends(get_current_user),
@@ -92,7 +94,9 @@ async def update_community(
     response_model=MembershipCreateResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("30/hour")
 async def join_community(
+    req: Request,
     community_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)
@@ -108,7 +112,9 @@ async def join_community(
     "/{community_id}/leave",
     response_model=MembershipLeaveResponse
 )
+@limiter.limit("20/hour")
 async def leave_community(
+    req: Request,
     community_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
     service: CommunityService = Depends(get_community_service)

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status, Request
 from typing import Optional
 from uuid import UUID
 import structlog
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import Database, get_db
+from app.core.rate_limit import limiter
 from app.services.comment_service import CommentService
 from app.models.comment import (
     CommentCreateRequest,
@@ -28,7 +29,9 @@ def get_comment_service(db: Database = Depends(get_db)) -> CommentService:
     response_model=CommentCreateResponse,
     status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("100/hour")
 async def create_comment(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     request: CommentCreateRequest,
@@ -47,7 +50,9 @@ async def create_comment(
     "/{community_id}/posts/{post_id}/comments/{comment_id}",
     response_model=CommentUpdateResponse
 )
+@limiter.limit("50/hour")
 async def update_comment(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
@@ -67,7 +72,9 @@ async def update_comment(
     "/{community_id}/posts/{post_id}/comments/{comment_id}",
     response_model=CommentDeleteResponse
 )
+@limiter.limit("50/hour")
 async def delete_comment(
+    req: Request,
     community_id: UUID,
     post_id: UUID,
     comment_id: UUID,
