@@ -19,6 +19,7 @@ from app.models.community import (
     MemberListResponse,
 )
 from app.utils.pagination import build_pagination_response
+from app.models.common import PaginationMeta
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -43,6 +44,42 @@ async def create_community(
     return await service.create_community(
         creator_user_id=UUID(current_user.user_id),
         request=body
+    )
+
+# E7: GET /api/v1/communities/search (MUST come before /{community_id})
+@router.get(
+    "/search",
+    response_model=CommunitySearchResponse
+)
+async def search_communities(
+    q: Optional[str] = Query(None),
+    organization_id: Optional[UUID] = Query(None),
+    tags: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+    service: CommunityService = Depends(get_community_service)
+):
+    """Search communities"""
+    # Parse comma-separated tags
+    tags_array = tags.split(',') if tags else None
+
+    communities, total_count = await service.search_communities(
+        search_text=q,
+        organization_id=organization_id,
+        tags=tags_array,
+        requesting_user_id=UUID(current_user.user_id) if current_user else None,
+        limit=limit,
+        offset=offset
+    )
+
+    return CommunitySearchResponse(
+        communities=communities,
+        pagination=PaginationMeta(
+            limit=limit,
+            offset=offset,
+            total_count=total_count
+        )
     )
 
 # E2: GET /api/v1/communities/{community_id}
@@ -147,40 +184,6 @@ async def get_members(
 
     return build_pagination_response(
         items=members,
-        total_count=total_count,
-        limit=limit,
-        offset=offset
-    )
-
-# E7: GET /api/v1/communities/search
-@router.get(
-    "/search",
-    response_model=CommunitySearchResponse
-)
-async def search_communities(
-    q: Optional[str] = Query(None),
-    organization_id: Optional[UUID] = Query(None),
-    tags: Optional[str] = Query(None),
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
-    service: CommunityService = Depends(get_community_service)
-):
-    """Search communities"""
-    # Parse comma-separated tags
-    tags_array = tags.split(',') if tags else None
-
-    communities, total_count = await service.search_communities(
-        search_text=q,
-        organization_id=organization_id,
-        tags=tags_array,
-        requesting_user_id=UUID(current_user.user_id) if current_user else None,
-        limit=limit,
-        offset=offset
-    )
-
-    return build_pagination_response(
-        items=communities,
         total_count=total_count,
         limit=limit,
         offset=offset

@@ -509,7 +509,7 @@ BEGIN
         c.icon_url,
         c.created_at,
         CASE WHEN cm.user_id IS NOT NULL THEN TRUE ELSE FALSE END as is_member,
-        COALESCE(ARRAY_AGG(ct.tag) FILTER (WHERE ct.tag IS NOT NULL), ARRAY[]::TEXT[]) as tags,
+        COALESCE(ARRAY_AGG(ct.tag::TEXT) FILTER (WHERE ct.tag IS NOT NULL), ARRAY[]::TEXT[]) as tags,
         COUNT(*) OVER() as total_count
     FROM activity.communities c
     LEFT JOIN activity.community_members cm

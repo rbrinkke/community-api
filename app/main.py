@@ -29,9 +29,56 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.0.0",
-    lifespan=lifespan
+    version=settings.API_VERSION,
+    description="""Community and group management service with member roles and permissions.
+
+Features 5 feature domains, stored procedure architecture, and comprehensive community lifecycle management.
+
+## Key Features
+- Community creation and management
+- Member roles (owner/admin/member)
+- Join requests and invitations
+- Community settings and privacy
+- Stored procedure architecture
+- 5 feature domains (core/members/settings/moderation/analytics)
+
+## Architecture
+- Database: PostgreSQL with `activity` schema
+- Auth: JWT Bearer with role validation
+- Rate limiting: Per-endpoint rate limits""",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.ENABLE_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_DOCS else None,
+    contact={"name": "Activity Platform Team", "email": "dev@activityapp.com"},
+    license_info={"name": "Proprietary"}
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    openapi_schema = get_openapi(
+        title=settings.PROJECT_NAME,
+        version=settings.API_VERSION,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Enter JWT token from auth-api"
+        }
+    }
+    openapi_schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # Rate limiting
 app.state.limiter = limiter

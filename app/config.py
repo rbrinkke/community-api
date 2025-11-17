@@ -8,7 +8,11 @@ class Settings(BaseSettings):
 
     # API
     API_V1_PREFIX: str = "/api/v1"
-    PROJECT_NAME: str = "Community API"
+    PROJECT_NAME: str = "Activity Platform - Community API"
+
+    # API Documentation (Swagger UI / OpenAPI)
+    ENABLE_DOCS: bool = True
+    API_VERSION: str = "1.0.0"
 
     # Database
     DATABASE_URL: str
